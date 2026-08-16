@@ -1,0 +1,9 @@
+# `viveNotes` is a symlink to a directory outside this repository — it exists so the app's source
+# and planning notes can be read while working here. It must never enter a build context.
+viveNotes
+
+.git
+.github
+memory
+*.md
+.env

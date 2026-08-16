@@ -1,0 +1,53 @@
+# Development and self-hosting stack.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#   curl localhost:8080/healthz
+#
+# The credentials below are development defaults and are overridable from the environment. A real
+# deployment sets VIVE_POSTGRES_PASSWORD, and puts a reverse proxy in front for TLS rather than
+# publishing 8080 (see S6 in memory/syncPlan.md).
+
+name: vivecserver
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: vive
+      POSTGRES_DB: vive
+      POSTGRES_PASSWORD: ${VIVE_POSTGRES_PASSWORD:-devonly}
+    volumes:
+      # `/var/lib/postgresql`, NOT the `/var/lib/postgresql/data` that every pre-18 example uses.
+      # The 18+ images store data in a major-version-specific subdirectory so that `pg_upgrade
+      # --link` never has to cross a mount boundary, and they refuse to start against a volume
+      # mounted the old way rather than risk it. Changing this later is a migration, not an edit.
+      - postgres-data:/var/lib/postgresql
+    # No published port. The server reaches PostgreSQL over the compose network, and a database
+    # listening on the host is the single most common way a self-hosted deployment gets breached.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vive -d vive"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      VIVE_DATABASE_URL: postgres://vive:${VIVE_POSTGRES_PASSWORD:-devonly}@postgres:5432/vive?sslmode=disable
+      VIVE_LISTEN_ADDR: ":8080"
+      VIVE_LOG_LEVEL: ${VIVE_LOG_LEVEL:-info}
+    ports:
+      - "8080:8080"
+    # The server migrates on startup, so it must not race PostgreSQL's first boot. Waiting for
+    # healthy rather than started is the difference between a clean `up` and one that fails on the
+    # first run and works on the second.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

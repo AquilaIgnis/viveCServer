@@ -1,3 +1,6 @@
 memory
-viveNotes/
+viveNotes
 .env
+
+# Locally built binary
+/vivecserver
