@@ -74,7 +74,8 @@ func run() error {
 
 	adminServer := newHTTPServer(settings.AdminListenAddress, httpapi.NewAdminHandler(pool, logger, liveLogBroker))
 	syncServer := newHTTPServer(settings.SyncListenAddress, httpapi.NewSyncHandler(pool, logger, httpapi.Options{
-		SignupMode: settings.SignupMode,
+		SignupMode:        settings.SignupMode,
+		BatchReplayWindow: settings.BatchReplayWindow,
 	}))
 	servers := []namedHTTPServer{
 		{name: "admin", server: adminServer},

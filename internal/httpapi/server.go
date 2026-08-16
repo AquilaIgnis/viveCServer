@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -19,6 +20,9 @@ import (
 // reach of a request handler that has no business with them.
 type Options struct {
 	SignupMode config.SignupMode
+
+	// How long a push response stays replayable for the device that sent it.
+	BatchReplayWindow time.Duration
 }
 
 // NewSyncHandler builds the device/sync routing tree with its middleware already wrapped around it.
@@ -39,6 +43,10 @@ func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) ht
 	// Everything else requires a device token.
 	mux.Handle("GET /v1/devices", authenticated(handleListDevices(pool, logger)))
 	mux.Handle("DELETE /v1/devices/{deviceID}", authenticated(handleRevokeDevice(pool, logger)))
+
+	mux.Handle("GET /v1/cursor", authenticated(handleReadCursor(pool, logger)))
+	mux.Handle("GET /v1/changes", authenticated(handlePullChanges(pool, logger)))
+	mux.Handle("POST /v1/changes", authenticated(handlePushChanges(pool, logger, options.BatchReplayWindow)))
 
 	return withPanicRecovery(withRequestLogging(mux, logger), logger)
 }

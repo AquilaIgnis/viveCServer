@@ -129,7 +129,7 @@ func ListDevices(ctx context.Context, pool *pgxpool.Pool, accountID string) ([]D
 // another's device, and re-revoking an already revoked device is not an error — the caller asked for
 // a state, and the state holds.
 func RevokeDevice(ctx context.Context, pool *pgxpool.Pool, accountID string, deviceID string) error {
-	if !isUUID(deviceID) {
+	if !IsUUID(deviceID) {
 		// Passing this to PostgreSQL would raise a cast error rather than answer the question.
 		return ErrDeviceNotFound
 	}
@@ -149,9 +149,13 @@ func RevokeDevice(ctx context.Context, pool *pgxpool.Pool, accountID string, dev
 	return nil
 }
 
-// isUUID reports whether a string is a well-formed UUID, using the parser pgx already carries so
+// IsUUID reports whether a string is a well-formed UUID, using the parser pgx already carries so
 // that this agrees exactly with what the database would accept.
-func isUUID(candidate string) bool {
+//
+// Exported because handlers need the same answer before a value reaches a `::uuid` cast: passing a
+// malformed id to PostgreSQL raises an error that aborts the surrounding transaction instead of
+// answering the question that was asked.
+func IsUUID(candidate string) bool {
 	var parsed pgtype.UUID
 	return parsed.Scan(candidate) == nil
 }

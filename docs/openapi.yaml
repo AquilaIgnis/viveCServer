@@ -2,8 +2,8 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.1.0
-  summary: Device authentication and management API for viveNotes.
+  version: 0.2.0
+  summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
     (container port 8281, host port 5444 in the supplied Compose deployment).
@@ -13,9 +13,15 @@ info:
     `POST /v1/devices` once with the account credentials and stores the returned device token.
     Subsequent authenticated requests use that token as a Bearer credential.
 
-    The note-change, cursor, ink, and blob endpoints planned for server phases S2-S5 are not yet
-    implemented and are deliberately absent from this contract. Add them here when their server
-    handlers ship so generated clients never treat planned operations as available ones.
+    Synchronisation covers the notebook, section, and page hierarchy. A client keeps one cursor per
+    account, polls `GET /v1/cursor`, pulls with `GET /v1/changes` when it has moved, and pushes its
+    own edits with `POST /v1/changes`. Concurrency is optimistic: every entity carries a
+    server-assigned `version`, a push states the version it believes it is editing, and a push that
+    lost the race comes back with the current server state rather than overwriting it.
+
+    Document bodies, ink, and attachment blobs are separate entity kinds arriving in server phases
+    S3-S5. They are not implemented and are deliberately absent from this contract. Add them here
+    when their handlers ship so generated clients never treat planned operations as available ones.
 
 servers:
   - url: http://localhost:5444
@@ -30,6 +36,8 @@ tags:
     description: Optional public account registration. Closed by default.
   - name: Devices
     description: Device registration, authentication, listing, and revocation.
+  - name: Sync
+    description: Cursor, change pull, and change push for the notebook hierarchy.
 
 paths:
   /healthz:
@@ -213,6 +221,150 @@ paths:
               example:
                 error: not_found
                 message: no such device
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/cursor:
+    get:
+      operationId: getCursor
+      tags: [Sync]
+      summary: Read the account's current change cursor
+      description: |
+        The idle poll. A client compares this value with its own stored cursor and pulls only when
+        they differ, so a client with an empty outbox and nothing to fetch makes this one request
+        per interval and stops. The server answers it with a single primary-key read.
+      security:
+        - deviceToken: []
+      responses:
+        "200":
+          description: The account's current cursor. A brand new account is at 0.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CursorResponse"
+              example:
+                cursor: 41
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/changes:
+    get:
+      operationId: pullChanges
+      tags: [Sync]
+      summary: Read the changes recorded after a cursor
+      description: |
+        Returns every change with a `seq` greater than `since`, oldest first and parents before
+        children within each `seq`.
+
+        A response never splits a push. Every entity a push accepted carries one `seq` value and
+        arrives in one response, which makes `limit` a request rather than a hard cap: a single push
+        larger than `limit` is still returned whole. Apply the whole response, then store `cursor`,
+        then repeat while `hasMore` is true.
+
+        The delta includes the calling device's own writes. That is deliberate — it is what lets a
+        device whose push response was lost recover the authoritative row by pulling.
+      security:
+        - deviceToken: []
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Exclusive lower bound. Omit or send 0 for a first full synchronisation.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+          example: 41
+        - name: limit
+          in: query
+          required: false
+          description: Requested page size. Rounded up to the end of a `seq` when one straddles it.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2048
+            default: 512
+      responses:
+        "200":
+          description: |
+            The delta, possibly empty. An empty `changes` with a `cursor` above `since` cannot
+            happen; a client that is ahead of the server receives the server's lower cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PullChangesResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: pushChanges
+      tags: [Sync]
+      summary: Apply a batch of local changes
+      description: |
+        Every change carries `baseVersion`, the version the client believes the server holds, where
+        0 means "I believe this entity is new". A change applies only while that is still the stored
+        version; otherwise it is rejected and the current server row travels back with the rejection
+        so the client can resolve it without another round trip.
+
+        The batch applies in one transaction. Everything it accepts receives one `seq`, so a page
+        and the section it was moved into can never reach another device separately. Rejecting one
+        entity does not fail the others: a change whose parent is unknown, whose version is stale,
+        or which cannot be read is refused on its own.
+
+        `batchId` is an idempotency key. Re-sending a batch under the same id within the server's
+        replay window returns the original response instead of applying the work a second time,
+        which is what makes a push safe to retry when its response was lost.
+
+        Send at most 512 changes and 4 MB per request; paginate beyond that.
+      security:
+        - deviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushChangesRequest"
+            example:
+              batchId: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
+              changes:
+                - kind: notebook
+                  id: 0c8f1f1e-6d1a-4a5f-9f3e-2b1c8b6a9d10
+                  baseVersion: 0
+                  updatedAt: 1755300000000
+                  name: Work
+                  colorArgb: -16777216
+                  sortIndex: 0
+                  expanded: true
+                  createdAt: 1755300000000
+      responses:
+        "200":
+          description: |
+            The batch was processed. A response with an empty `applied` and a populated `rejected`
+            is a successful request describing a batch that changed nothing.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushChangesResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "413":
+          description: The batch exceeds 4 MiB.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: payload_too_large
+                message: request body is too large
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -402,6 +554,321 @@ components:
           type: string
           format: date-time
           description: Omitted for active devices.
+
+    CursorResponse:
+      type: object
+      additionalProperties: false
+      required: [cursor]
+      properties:
+        cursor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The account's newest change sequence value.
+
+    PullChangesResponse:
+      type: object
+      additionalProperties: false
+      required: [changes, cursor, hasMore]
+      properties:
+        changes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Change"
+        cursor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Store this only after every change in the response has been applied. It is always a
+            complete sequence boundary.
+        hasMore:
+          type: boolean
+          description: True when more changes exist beyond `cursor`. Pull again immediately.
+
+    PushChangesRequest:
+      type: object
+      additionalProperties: false
+      required: [batchId, changes]
+      properties:
+        batchId:
+          type: string
+          format: uuid
+          description: |
+            Idempotency key. Generate one per batch and reuse it for every retry of that batch.
+          example: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
+        changes:
+          type: array
+          maxItems: 512
+          items:
+            $ref: "#/components/schemas/PushChange"
+
+    PushChangesResponse:
+      type: object
+      additionalProperties: false
+      required: [applied, rejected, cursor]
+      properties:
+        applied:
+          type: array
+          items:
+            $ref: "#/components/schemas/AppliedChange"
+        rejected:
+          type: array
+          items:
+            $ref: "#/components/schemas/RejectedChange"
+        cursor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The account's cursor after the batch, which for a batch that applied anything is the
+            sequence value stamped on every entity it accepted. It is not a pull cursor: other
+            devices' changes may sit below it.
+
+    AppliedChange:
+      type: object
+      additionalProperties: false
+      required: [kind, id, version]
+      properties:
+        kind:
+          $ref: "#/components/schemas/EntityKind"
+        id:
+          type: string
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The stored version now. Send it as `baseVersion` on the next edit.
+
+    RejectedChange:
+      type: object
+      additionalProperties: false
+      required: [kind, id, reason]
+      properties:
+        kind:
+          type: string
+          description: The kind the client sent, which for an unrecognised kind is not in EntityKind.
+        id:
+          type: string
+        reason:
+          $ref: "#/components/schemas/RejectionReason"
+        message:
+          type: string
+          description: Human-readable detail. Client logic must branch on `reason`, not this field.
+        current:
+          $ref: "#/components/schemas/Change"
+
+    RejectionReason:
+      type: string
+      description: |
+        `version_conflict` — the entity moved on, or the server has never held it; `current` carries
+        the stored row when there is one, and is absent when there is not.
+        `missing_parent` — the notebook or section it belongs to has not been uploaded. Push the
+        parent, then retry this entity.
+        `too_large` — a field is longer than the limit `.vive` bundles use for the same field.
+        `malformed` — the change could not be read as the kind it claims to be, its id is unusable,
+        the same entity appeared twice in one batch, or the kind is one this server does not know.
+      enum:
+        - version_conflict
+        - missing_parent
+        - too_large
+        - malformed
+
+    EntityKind:
+      type: string
+      description: Synced entity kinds. Document bodies, ink, and attachments join this list in S3-S5.
+      enum:
+        - notebook
+        - section
+        - page
+
+    ChangeEnvelope:
+      type: object
+      required: [kind, id, version, seq, updatedAt]
+      properties:
+        kind:
+          $ref: "#/components/schemas/EntityKind"
+        id:
+          type: string
+          maxLength: 512
+          description: Client-generated and stable for the life of the entity.
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Server-assigned, incremented on every accepted write.
+        seq:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The account sequence value this write was stamped with.
+        deletedAt:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Tombstone timestamp in client epoch milliseconds, or null. A deleted entity keeps all of
+            its other fields; it is not removed from the delta.
+        updatedAt:
+          type: integer
+          format: int64
+          description: |
+            The writing client's wall clock in epoch milliseconds. Convergence never depends on it;
+            it is for display and for the client's own merge heuristics.
+
+    PushChangeEnvelope:
+      type: object
+      required: [kind, id, baseVersion, updatedAt]
+      properties:
+        kind:
+          $ref: "#/components/schemas/EntityKind"
+        id:
+          type: string
+          maxLength: 512
+        baseVersion:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The version the client believes the server holds. 0 asserts the entity is new; a stored
+            entity then rejects with `version_conflict` and its current state, which is also how a
+            client that lost its local state recovers.
+        deletedAt:
+          type: [integer, "null"]
+          format: int64
+          description: Set to delete. Send the entity's other fields as they stand locally.
+        updatedAt:
+          type: integer
+          format: int64
+
+    Change:
+      description: |
+        One stored entity as the server returns it.
+
+        Properties beyond those described here are preserved: a field a newer client sends that this
+        server has no column for is stored verbatim and returned at the top level unchanged. A
+        client must therefore never reject a change for carrying a field it does not recognise, and
+        must never treat this schema as closed.
+      oneOf:
+        - $ref: "#/components/schemas/NotebookChange"
+        - $ref: "#/components/schemas/SectionChange"
+        - $ref: "#/components/schemas/PageChange"
+      discriminator:
+        propertyName: kind
+        mapping:
+          notebook: "#/components/schemas/NotebookChange"
+          section: "#/components/schemas/SectionChange"
+          page: "#/components/schemas/PageChange"
+
+    PushChange:
+      description: |
+        One entity as the client sends it. Unrecognised properties are accepted and stored, subject
+        to a 16 KiB limit per entity.
+      oneOf:
+        - $ref: "#/components/schemas/NotebookPush"
+        - $ref: "#/components/schemas/SectionPush"
+        - $ref: "#/components/schemas/PagePush"
+      discriminator:
+        propertyName: kind
+        mapping:
+          notebook: "#/components/schemas/NotebookPush"
+          section: "#/components/schemas/SectionPush"
+          page: "#/components/schemas/PagePush"
+
+    NotebookFields:
+      type: object
+      additionalProperties: true
+      required: [name, colorArgb, sortIndex, expanded, createdAt]
+      properties:
+        name:
+          type: string
+          maxLength: 512
+        colorArgb:
+          type: integer
+          format: int32
+        sortIndex:
+          type: integer
+          format: int32
+        expanded:
+          type: boolean
+          description: Rail expansion state. Synced for now because it lives on the entity.
+        createdAt:
+          type: integer
+          format: int64
+
+    SectionFields:
+      type: object
+      additionalProperties: true
+      required: [notebookId, name, colorArgb, sortIndex, createdAt]
+      properties:
+        notebookId:
+          type: string
+          maxLength: 512
+          description: Must already exist on the account, or arrive earlier in the same batch.
+        name:
+          type: string
+          maxLength: 512
+        colorArgb:
+          type: integer
+          format: int32
+        sortIndex:
+          type: integer
+          format: int32
+        createdAt:
+          type: integer
+          format: int64
+
+    PageFields:
+      type: object
+      additionalProperties: true
+      required: [sectionId, title, sortIndex, preview, createdAt]
+      properties:
+        sectionId:
+          type: string
+          maxLength: 512
+          description: Must already exist on the account, or arrive earlier in the same batch.
+        title:
+          type: string
+          maxLength: 512
+        sortIndex:
+          type: integer
+          format: int32
+        preview:
+          type: string
+          maxLength: 4096
+          description: Denormalised first line of body text. The document itself syncs in S3.
+        createdAt:
+          type: integer
+          format: int64
+
+    NotebookChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/NotebookFields"
+
+    SectionChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/SectionFields"
+
+    PageChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/PageFields"
+
+    NotebookPush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/NotebookFields"
+
+    SectionPush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/SectionFields"
+
+    PagePush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/PageFields"
 
     ErrorResponse:
       type: object

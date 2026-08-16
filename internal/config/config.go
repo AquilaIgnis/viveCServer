@@ -40,6 +40,13 @@ type Config struct {
 	// How long in-flight requests get to finish after a shutdown signal arrives. Sync pushes are
 	// short, so this is generous rather than tuned.
 	ShutdownTimeout time.Duration
+
+	// How long a push response stays replayable for the device that sent it.
+	//
+	// It only has to outlive a client's retry of a batch whose response was lost, which is minutes
+	// at the outside; a day of margin costs one small row per push and makes the window a
+	// non-question for anyone self-hosting.
+	BatchReplayWindow time.Duration
 }
 
 const (
@@ -49,6 +56,12 @@ const (
 	logLevelSetting           = "VIVE_LOG_LEVEL"
 	shutdownTimeoutSetting    = "VIVE_SHUTDOWN_TIMEOUT"
 	signupModeSetting         = "VIVE_SIGNUP_MODE"
+
+	// syncPlan.md §7 named this VIVE_BATCH_REPLAY_HOURS. It takes a duration instead, because every
+	// other time setting here does: a surface where one knob is a bare number of hours is one where
+	// an operator eventually writes `24h` into it and gets a parse error, or writes `48` into one of
+	// the others and gets 48 nanoseconds.
+	batchReplayWindowSetting = "VIVE_BATCH_REPLAY_WINDOW"
 )
 
 // Load reads configuration from the environment, having first merged any `.env` file beside the
@@ -77,6 +90,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	batchReplayWindow, err := readDurationSetting(batchReplayWindowSetting, 24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+
 	settings := Config{
 		AdminListenAddress: readStringSetting(adminListenAddressSetting, ":8080"),
 		SyncListenAddress:  readStringSetting(syncListenAddressSetting, ":8281"),
@@ -84,6 +102,7 @@ func Load() (Config, error) {
 		LogLevel:           logLevel,
 		SignupMode:         signupMode,
 		ShutdownTimeout:    shutdownTimeout,
+		BatchReplayWindow:  batchReplayWindow,
 	}
 
 	if settings.AdminListenAddress == settings.SyncListenAddress {
