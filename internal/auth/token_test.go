@@ -37,6 +37,25 @@ func TestMintDeviceTokenIsUnique(t *testing.T) {
 	}
 }
 
+func TestAdminSessionTokensStayOnTheAdminSurface(t *testing.T) {
+	plainToken, tokenHash, err := MintAdminSessionToken()
+	if err != nil {
+		t.Fatalf("minting failed: %v", err)
+	}
+	if !strings.HasPrefix(plainToken, AdminSessionTokenPrefix) {
+		t.Fatalf("admin token %q does not carry its prefix", plainToken)
+	}
+	if string(HashToken(plainToken)) != string(tokenHash) {
+		t.Fatal("hashing an admin token does not reproduce its stored digest")
+	}
+	if parsed, ok := ParseAdminSessionToken(plainToken); !ok || parsed != plainToken {
+		t.Fatalf("ParseAdminSessionToken rejected its own token: (%q, %v)", parsed, ok)
+	}
+	if _, ok := ParseAdminSessionToken("vive_device-shaped"); ok {
+		t.Fatal("admin parser accepted a device token")
+	}
+}
+
 func TestParseBearerToken(t *testing.T) {
 	accepted := map[string]string{
 		"Bearer vive_abc": "vive_abc",

@@ -4,6 +4,12 @@ viveNotes
 
 .git
 .github
+.agents
+.codex
 memory
 *.md
 .env
+deploy/.env
+data
+deploy/data
+**/data

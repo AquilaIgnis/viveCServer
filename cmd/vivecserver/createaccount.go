@@ -25,12 +25,11 @@ const passwordEnvironmentVariable = "VIVE_ACCOUNT_PASSWORD"
 
 // runCreateAccount creates an account from the command line.
 //
-// This exists because the default signup mode is closed (config.SignupModeClosed), which leaves no
-// way to make the first account over HTTP — deliberately, since a self-hosted server with open
-// registration is a service other people will sign up to. Shipping the subcommand in the same
-// binary means a self-hoster needs nothing else installed:
+// Browser setup is the normal way to create the first account. This remains as an unattended and
+// recovery path, and can create another account without temporarily opening public registration.
+// Shipping it in the same binary means a self-hoster needs nothing else installed:
 //
-//	docker compose -f deploy/docker-compose.yml run --rm -T server create-account -email you@example.com
+//	docker compose -f deploy/docker-compose.yml run --rm -T vivecserver create-account -email you@example.com
 func runCreateAccount(arguments []string) error {
 	flags := flag.NewFlagSet("create-account", flag.ContinueOnError)
 	emailFlag := flags.String("email", "", "email address for the new account (required)")

@@ -1,0 +1,448 @@
+openapi: 3.1.2
+
+info:
+  title: Vive Notes Community Server API
+  version: 0.1.0
+  summary: Device authentication and management API for viveNotes.
+  description: |
+    This document describes the API currently implemented on viveCServer's sync listener
+    (container port 8281, host port 5444 in the supplied Compose deployment).
+
+    The browser setup and administration interface on port 8080 is intentionally not part of this
+    API. A server owner creates the first account there. A viveNotes client then calls
+    `POST /v1/devices` once with the account credentials and stores the returned device token.
+    Subsequent authenticated requests use that token as a Bearer credential.
+
+    The note-change, cursor, ink, and blob endpoints planned for server phases S2-S5 are not yet
+    implemented and are deliberately absent from this contract. Add them here when their server
+    handlers ship so generated clients never treat planned operations as available ones.
+
+servers:
+  - url: http://localhost:5444
+    description: Server running on the same computer as the API caller.
+  - url: http://10.0.2.2:5444
+    description: Host computer as reached from the standard Android Emulator.
+
+tags:
+  - name: Health
+    description: Process and PostgreSQL availability probes.
+  - name: Accounts
+    description: Optional public account registration. Closed by default.
+  - name: Devices
+    description: Device registration, authentication, listing, and revocation.
+
+paths:
+  /healthz:
+    get:
+      operationId: getLiveness
+      tags: [Health]
+      summary: Check whether the server process is running
+      description: This probe does not access PostgreSQL and remains healthy during a database outage.
+      security: []
+      responses:
+        "200":
+          description: The server process is running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthyStatus"
+              example:
+                status: ok
+
+  /readyz:
+    get:
+      operationId: getReadiness
+      tags: [Health]
+      summary: Check whether the server can reach PostgreSQL
+      security: []
+      responses:
+        "200":
+          description: The server and PostgreSQL are ready to serve requests.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthyStatus"
+              example:
+                status: ok
+        "503":
+          description: PostgreSQL is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnavailableStatus"
+              example:
+                status: unavailable
+                reason: database
+
+  /v1/accounts:
+    post:
+      operationId: createAccount
+      tags: [Accounts]
+      summary: Create an account when public registration is enabled
+      description: |
+        This endpoint returns `403 signup_closed` under the default `VIVE_SIGNUP_MODE=closed`
+        configuration. Self-hosted users normally create the first account through the browser
+        setup wizard on port 8080, not through this operation.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountRequest"
+            example:
+              email: owner@example.com
+              password: correct horse battery staple
+      responses:
+        "201":
+          description: Account created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateAccountResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "403":
+          description: Public account registration is disabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: signup_closed
+                message: this server does not accept registrations; the operator creates accounts with the create-account command
+        "409":
+          description: An account already uses the submitted email address.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: email_taken
+                message: an account already exists for that email address
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/devices:
+    post:
+      operationId: registerDevice
+      tags: [Devices]
+      summary: Exchange account credentials for a device token
+      description: |
+        Call this once when connecting a viveNotes installation to the server. The plaintext device
+        token is returned exactly once and cannot be recovered later because the server stores only
+        its SHA-256 digest. If the client loses it, register a new device.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterDeviceRequest"
+            example:
+              email: owner@example.com
+              password: correct horse battery staple
+              name: Pixel Tablet Emulator
+              platform: Android
+      responses:
+        "201":
+          description: Device registered. Persist the returned token in secure client storage.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterDeviceResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          description: The email or password is incorrect.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: invalid_credentials
+                message: email or password is incorrect
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    get:
+      operationId: listDevices
+      tags: [Devices]
+      summary: List every device registered to the authenticated account
+      security:
+        - deviceToken: []
+      responses:
+        "200":
+          description: Registered devices, newest first. Revoked devices remain in the list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListDevicesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/devices/{deviceID}:
+    delete:
+      operationId: revokeDevice
+      tags: [Devices]
+      summary: Revoke a registered device
+      description: |
+        The target must belong to the authenticated account. A device may revoke itself; its token
+        becomes invalid on the next request. Re-revoking an already revoked device is successful.
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      responses:
+        "204":
+          description: Device revoked. The response has no body.
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          description: No matching device exists for the authenticated account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: not_found
+                message: no such device
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    deviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: vive_<base64url>
+      description: Device token returned once by `POST /v1/devices`.
+
+  parameters:
+    DeviceID:
+      name: deviceID
+      in: path
+      required: true
+      description: Server-assigned device UUID.
+      schema:
+        type: string
+        format: uuid
+      example: 7af9be36-8f89-4b31-bc78-3ef246837469
+
+  responses:
+    InvalidRequest:
+      description: The JSON body or one of its fields is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: invalid_request
+            message: request body is not valid JSON
+
+    PayloadTooLarge:
+      description: The authentication request exceeds 64 KiB.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: payload_too_large
+            message: request body is too large
+
+    Unauthenticated:
+      description: A device token is missing, unknown, or revoked.
+      headers:
+        WWW-Authenticate:
+          description: Bearer authentication challenge.
+          schema:
+            type: string
+          example: Bearer realm="vivecserver", error="invalid_token"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: unauthenticated
+            message: unknown or revoked token
+
+    InternalError:
+      description: The server could not complete the operation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: internal
+            message: something went wrong
+
+  schemas:
+    CreateAccountRequest:
+      type: object
+      additionalProperties: true
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+          description: Email addresses are trimmed and lowercased before storage.
+          example: owner@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 1024
+          writeOnly: true
+
+    CreateAccountResponse:
+      type: object
+      additionalProperties: false
+      required: [accountId]
+      properties:
+        accountId:
+          type: string
+          format: uuid
+          example: a62c615f-5a73-47bb-b704-ad49cf527ec2
+
+    RegisterDeviceRequest:
+      type: object
+      additionalProperties: true
+      required: [email, password, name]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+          example: owner@example.com
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 1024
+          writeOnly: true
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Human-readable device name after trimming surrounding whitespace.
+          example: Pixel Tablet Emulator
+        platform:
+          type: string
+          maxLength: 64
+          default: ""
+          description: Optional platform label used only for display.
+          example: Android
+
+    RegisterDeviceResponse:
+      type: object
+      additionalProperties: false
+      required: [deviceId, accountId, token]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          example: 7af9be36-8f89-4b31-bc78-3ef246837469
+        accountId:
+          type: string
+          format: uuid
+          example: a62c615f-5a73-47bb-b704-ad49cf527ec2
+        token:
+          type: string
+          pattern: "^vive_[A-Za-z0-9_-]+$"
+          description: Bearer credential returned only by this response. Store it securely.
+          example: vive_c29tZS1leGFtcGxlLWRldmljZS10b2tlbg
+
+    ListDevicesResponse:
+      type: object
+      additionalProperties: false
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: "#/components/schemas/Device"
+
+    Device:
+      type: object
+      additionalProperties: false
+      required:
+        - deviceId
+        - name
+        - platform
+        - createdAt
+        - lastPulledSeq
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        platform:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: string
+          format: date-time
+          description: Omitted until the device first authenticates after registration.
+        lastPulledSeq:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Diagnostic cursor last reported by the device.
+        revokedAt:
+          type: string
+          format: date-time
+          description: Omitted for active devices.
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          description: Human-readable detail. Client logic must branch on `error`, not this field.
+
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_request
+        - invalid_credentials
+        - signup_closed
+        - email_taken
+        - unauthenticated
+        - not_found
+        - payload_too_large
+        - internal
+
+    HealthyStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+
+    UnavailableStatus:
+      type: object
+      additionalProperties: false
+      required: [status, reason]
+      properties:
+        status:
+          type: string
+          const: unavailable
+        reason:
+          type: string
+          const: database

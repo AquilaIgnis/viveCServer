@@ -26,6 +26,6 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/vivecserver /usr/local/bin/vivecserver
 
 USER nonroot:nonroot
-EXPOSE 8080
+EXPOSE 8080 8281
 
 ENTRYPOINT ["/usr/local/bin/vivecserver"]

@@ -31,10 +31,11 @@ const (
 
 // Config is the fully validated configuration. Every field is safe to use without a further check.
 type Config struct {
-	ListenAddress string
-	DatabaseURL   string
-	LogLevel      slog.Level
-	SignupMode    SignupMode
+	AdminListenAddress string
+	SyncListenAddress  string
+	DatabaseURL        string
+	LogLevel           slog.Level
+	SignupMode         SignupMode
 
 	// How long in-flight requests get to finish after a shutdown signal arrives. Sync pushes are
 	// short, so this is generous rather than tuned.
@@ -42,11 +43,12 @@ type Config struct {
 }
 
 const (
-	listenAddressSetting   = "VIVE_LISTEN_ADDR"
-	databaseURLSetting     = "VIVE_DATABASE_URL"
-	logLevelSetting        = "VIVE_LOG_LEVEL"
-	shutdownTimeoutSetting = "VIVE_SHUTDOWN_TIMEOUT"
-	signupModeSetting      = "VIVE_SIGNUP_MODE"
+	adminListenAddressSetting = "VIVE_ADMIN_LISTEN_ADDR"
+	syncListenAddressSetting  = "VIVE_SYNC_LISTEN_ADDR"
+	databaseURLSetting        = "VIVE_DATABASE_URL"
+	logLevelSetting           = "VIVE_LOG_LEVEL"
+	shutdownTimeoutSetting    = "VIVE_SHUTDOWN_TIMEOUT"
+	signupModeSetting         = "VIVE_SIGNUP_MODE"
 )
 
 // Load reads configuration from the environment, having first merged any `.env` file beside the
@@ -76,11 +78,16 @@ func Load() (Config, error) {
 	}
 
 	settings := Config{
-		ListenAddress:   readStringSetting(listenAddressSetting, ":8080"),
-		DatabaseURL:     readStringSetting(databaseURLSetting, ""),
-		LogLevel:        logLevel,
-		SignupMode:      signupMode,
-		ShutdownTimeout: shutdownTimeout,
+		AdminListenAddress: readStringSetting(adminListenAddressSetting, ":8080"),
+		SyncListenAddress:  readStringSetting(syncListenAddressSetting, ":8281"),
+		DatabaseURL:        readStringSetting(databaseURLSetting, ""),
+		LogLevel:           logLevel,
+		SignupMode:         signupMode,
+		ShutdownTimeout:    shutdownTimeout,
+	}
+
+	if settings.AdminListenAddress == settings.SyncListenAddress {
+		return Config{}, fmt.Errorf("%s and %s must use different addresses", adminListenAddressSetting, syncListenAddressSetting)
 	}
 
 	// The database URL carries a password, so it is the one setting that must never reach a log

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AquilaIgnis/viveCServer/internal/config"
+	"github.com/AquilaIgnis/viveCServer/internal/livelog"
 )
 
 // Options is what the HTTP layer needs to know about the server's configuration.
@@ -20,11 +21,11 @@ type Options struct {
 	SignupMode config.SignupMode
 }
 
-// NewHandler builds the routing tree with its middleware already wrapped around it.
+// NewSyncHandler builds the device/sync routing tree with its middleware already wrapped around it.
 //
 // Routes use Go's method-and-pattern syntax, so a request with the right path and the wrong method
 // gets a 405 from the standard library rather than a hand-written check in every handler.
-func NewHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) http.Handler {
+func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) http.Handler {
 	mux := http.NewServeMux()
 	authenticated := requireAuthentication(pool, logger)
 
@@ -40,6 +41,13 @@ func NewHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) http.H
 	mux.Handle("DELETE /v1/devices/{deviceID}", authenticated(handleRevokeDevice(pool, logger)))
 
 	return withPanicRecovery(withRequestLogging(mux, logger), logger)
+}
+
+// NewAdminHandler builds the browser-only setup and administration surface. It intentionally does
+// not register /v1 routes: publishing port 8080 must never accidentally publish the sync API too.
+func NewAdminHandler(pool *pgxpool.Pool, logger *slog.Logger, liveLogs *livelog.Broker) http.Handler {
+	application := adminApplication{store: postgresAdminStore{pool: pool}, logger: logger, liveLogs: liveLogs}
+	return application.handler(pool)
 }
 
 // writeJSON is the single place a response body is produced, so every response is encoded the same

@@ -1,0 +1,10 @@
+# Development override: build the server from the working tree instead of pulling Docker Hub.
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up --build
+
+services:
+  vivecserver:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    pull_policy: build
