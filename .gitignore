@@ -1,8 +1,7 @@
 memory
 viveNotes
 .env
-
-
+deploy/data/
 
 
 # Locally built binary
