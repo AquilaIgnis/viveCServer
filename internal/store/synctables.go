@@ -174,6 +174,34 @@ var syncKinds = []*SyncKind{
 		changeJSON: pageContentChangeJSON,
 		newFields:  func() EntityFields { return &PageContentFields{} },
 	},
+	// The three ink kinds hang from a page and never from each other. An erase names the strokes it
+	// affected, but as inert ids rather than as a parent: enforcing them would wedge a client the
+	// first time a target arrived in a later delta page or had already been purged (inkoperations.go,
+	// validateInkTargets).
+	{
+		Name:       "inkStroke",
+		Rank:       4,
+		Table:      "ink_strokes",
+		ParentKind: "page",
+		changeJSON: inkStrokeChangeJSON,
+		newFields:  func() EntityFields { return &InkStrokeFields{} },
+	},
+	{
+		Name:       "inkErase",
+		Rank:       5,
+		Table:      "ink_erases",
+		ParentKind: "page",
+		changeJSON: inkEraseChangeJSON,
+		newFields:  func() EntityFields { return &InkEraseFields{} },
+	},
+	{
+		Name:       "inkMove",
+		Rank:       6,
+		Table:      "ink_moves",
+		ParentKind: "page",
+		changeJSON: inkMoveChangeJSON,
+		newFields:  func() EntityFields { return &InkMoveFields{} },
+	},
 }
 
 var syncKindsByName = func() map[string]*SyncKind {

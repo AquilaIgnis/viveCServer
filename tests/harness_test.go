@@ -401,6 +401,70 @@ func pageContentChange(pageID string, baseVersion int64, doc []byte) map[string]
 	}
 }
 
+// inkStrokeChange is one stroke as a client sends it.
+//
+// `drawOrder` and not `seq`: the envelope owns `seq`, and a stroke that sent its draw order under
+// that name would have it stripped as an envelope field and stored nowhere.
+func inkStrokeChange(id string, baseVersion int64, pageID string, drawOrder int, points []byte) map[string]any {
+	return map[string]any{
+		"kind":          "inkStroke",
+		"id":            id,
+		"baseVersion":   baseVersion,
+		"updatedAt":     1_700_000_000_000,
+		"pageId":        pageID,
+		"drawOrder":     drawOrder,
+		"brushFamily":   "pressure-pen",
+		"brushVersion":  1,
+		"sizeDp":        3.5,
+		"colorArgb":     -16777216,
+		"epsilon":       0.1,
+		"stabilization": 2,
+		"minX":          1.5,
+		"minY":          2.5,
+		"maxX":          3.5,
+		"maxY":          4.5,
+		"points":        points,
+		"enc":           "ink/v1",
+		"createdAt":     1_700_000_000_000,
+	}
+}
+
+func inkEraseChange(id string, baseVersion int64, pageID string, targetIDs []string) map[string]any {
+	return map[string]any{
+		"kind":        "inkErase",
+		"id":          id,
+		"baseVersion": baseVersion,
+		"updatedAt":   1_700_000_000_000,
+		"pageId":      pageID,
+		"mode":        "Normal",
+		"sizeDp":      8.0,
+		"points":      []byte{1, 2, 3},
+		"enc":         "ink/v1",
+		"createdAt":   1_700_000_000_000,
+		"targetIds":   targetIDs,
+	}
+}
+
+func inkMoveChange(id string, baseVersion int64, pageID string, targetIDs []string) map[string]any {
+	return map[string]any{
+		"kind":        "inkMove",
+		"id":          id,
+		"baseVersion": baseVersion,
+		"updatedAt":   1_700_000_000_000,
+		"pageId":      pageID,
+		"dxDp":        12.5,
+		"dyDp":        -4.25,
+		"scaleX":      1.0,
+		"scaleY":      1.0,
+		"anchorX":     0.0,
+		"anchorY":     0.0,
+		"points":      []byte{4, 5, 6, 7},
+		"enc":         "ink/v1",
+		"createdAt":   1_700_000_000_000,
+		"targetIds":   targetIDs,
+	}
+}
+
 // changeOfKind finds the one change of a kind in a delta. Bodies share their page's id, so indexing
 // a delta by id alone cannot tell a page from the document hanging off it.
 func changeOfKind(t *testing.T, changes []map[string]any, kind string) map[string]any {

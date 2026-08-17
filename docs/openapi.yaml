@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.3.0
+  version: 0.4.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -20,10 +20,16 @@ info:
     lost the race comes back with the current server state rather than overwriting it.
 
     Document bodies are the `pageContent` kind (S3): opaque bytes with a codec id and a checksum,
-    which the server stores and returns without ever parsing. Ink and attachment blobs are separate
-    kinds arriving in S4-S5. They are not implemented and are deliberately absent from this
-    contract. Add them here when their handlers ship so generated clients never treat planned
-    operations as available ones.
+    which the server stores and returns without ever parsing.
+
+    Ink is three more kinds (S4), all hanging from a page: `inkStroke`, and the two replayable
+    operations `inkErase` and `inkMove`. Their points are opaque bytes with an encoder id, the way a
+    document body is, and each operation carries the ids of the strokes it affected inside itself.
+    Ink conflicts are rare by construction rather than by rule — two devices never write the same
+    stroke id — so it takes the same optimistic concurrency path as everything else. Attachment
+    blobs are separate operations arriving in S5; they are not implemented and are deliberately
+    absent from this contract. Add them here when their handlers ship so generated clients never
+    treat planned operations as available ones.
 
 servers:
   - url: http://localhost:5444
@@ -728,12 +734,17 @@ components:
 
     EntityKind:
       type: string
-      description: Synced entity kinds. Ink and attachments join this list in S4-S5.
+      description: |
+        Synced entity kinds, in apply order: a parent is always applied and emitted before its
+        children. Attachments join this list in S5.
       enum:
         - notebook
         - section
         - page
         - pageContent
+        - inkStroke
+        - inkErase
+        - inkMove
 
     ChangeEnvelope:
       type: object
@@ -806,6 +817,9 @@ components:
         - $ref: "#/components/schemas/SectionChange"
         - $ref: "#/components/schemas/PageChange"
         - $ref: "#/components/schemas/PageContentChange"
+        - $ref: "#/components/schemas/InkStrokeChange"
+        - $ref: "#/components/schemas/InkEraseChange"
+        - $ref: "#/components/schemas/InkMoveChange"
       discriminator:
         propertyName: kind
         mapping:
@@ -813,6 +827,9 @@ components:
           section: "#/components/schemas/SectionChange"
           page: "#/components/schemas/PageChange"
           pageContent: "#/components/schemas/PageContentChange"
+          inkStroke: "#/components/schemas/InkStrokeChange"
+          inkErase: "#/components/schemas/InkEraseChange"
+          inkMove: "#/components/schemas/InkMoveChange"
 
     PushChange:
       description: |
@@ -823,6 +840,9 @@ components:
         - $ref: "#/components/schemas/SectionPush"
         - $ref: "#/components/schemas/PagePush"
         - $ref: "#/components/schemas/PageContentPush"
+        - $ref: "#/components/schemas/InkStrokePush"
+        - $ref: "#/components/schemas/InkErasePush"
+        - $ref: "#/components/schemas/InkMovePush"
       discriminator:
         propertyName: kind
         mapping:
@@ -830,6 +850,9 @@ components:
           section: "#/components/schemas/SectionPush"
           page: "#/components/schemas/PagePush"
           pageContent: "#/components/schemas/PageContentPush"
+          inkStroke: "#/components/schemas/InkStrokePush"
+          inkErase: "#/components/schemas/InkErasePush"
+          inkMove: "#/components/schemas/InkMovePush"
 
     NotebookFields:
       type: object
@@ -932,6 +955,186 @@ components:
           maxLength: 128
           description: How `doc` is wrapped before storage. Absent means `none/1`, which is what the server returns.
 
+    InkStrokeFields:
+      type: object
+      additionalProperties: true
+      required: [pageId, drawOrder, brushFamily, brushVersion, sizeDp, colorArgb, epsilon, stabilization, minX, minY, maxX, maxY, points, createdAt]
+      description: |
+        One stroke. Immutable in everything that draws it — points, brush, bounds — with a small
+        mutable envelope: `deletedAt` (an erase tombstones a stroke, an undo clears it again),
+        `colorArgb` with `colorFollowsTheme`, and `groupId`. Those take the ordinary optimistic
+        concurrency path like any other kind; there is no insert-only fast path for ink, because one
+        would silently drop both an erase and the undo of one.
+      properties:
+        pageId:
+          type: string
+          maxLength: 512
+          description: The page this stroke is on, which must already exist on the account or arrive earlier in the same batch.
+        drawOrder:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Draw order within the page — later strokes paint on top — and a page-scoped Lamport
+            clock rather than a count. A client allocates `max(seq) + 1` over every stroke it holds,
+            including ones pulled from other devices, so a stroke is always numbered above everything
+            that device has seen. **It is not unique and not dense**: two devices drawing offline on
+            one page allocate the same value, which is correct, and the tie is broken by ascending
+            `id`. Named `drawOrder` and not `seq` because `seq` is the envelope's account sequence;
+            a client sending it under that name would have it dropped as an envelope field.
+        brushFamily:
+          type: string
+          maxLength: 128
+          description: Stock brush id — `marker`, `pressure-pen`, `highlighter`, `dashed-line`.
+        brushVersion:
+          type: integer
+          format: int32
+          description: Pinned at creation, never "latest", so a brush that gains a V2 cannot restyle old ink.
+        sizeDp:
+          type: number
+          format: float
+        colorArgb:
+          type: integer
+          format: int32
+        colorFollowsTheme:
+          type: [boolean, "null"]
+          description: |
+            Whether `colorArgb` was the automatic colour rather than one the user picked, so Switch
+            Background can re-resolve it. Absent or null on a stroke drawn before the app recorded
+            the intent — a third state, not a default.
+        epsilon:
+          type: number
+          format: float
+          description: Mesh tolerance the stroke was built with, which pins its fidelity across library versions.
+        stabilization:
+          type: integer
+          format: int32
+          description: The pen's stabilization level when drawn, 0-5. Per stroke rather than per pen, because a stroke has to come back looking like the stroke that was drawn.
+        minX:
+          type: number
+          format: float
+        minY:
+          type: number
+          format: float
+        maxX:
+          type: number
+          format: float
+        maxY:
+          type: number
+          format: float
+        points:
+          type: string
+          format: byte
+          description: |
+            The encoded input points, base64, opaque to the server. At most 4 MiB before encoding,
+            matching what a `.vive` bundle accepts; a batch is capped at 4 MB, so anything near this
+            can only travel alone.
+        enc:
+          type: string
+          maxLength: 128
+          description: Id of the encoder that wrote `points`. Absent means `ink/v1`, which is what the server returns.
+        createdAt:
+          type: integer
+          format: int64
+        groupId:
+          type: [string, "null"]
+          maxLength: 512
+          description: Optional logical object group. Geometry stays immutable when membership changes.
+
+    InkOperationTargets:
+      type: object
+      properties:
+        targetIds:
+          type: array
+          maxItems: 100000
+          items:
+            type: string
+            maxLength: 512
+          description: |
+            The strokes this operation was allowed to affect, carried inside the operation and
+            replaced wholesale — never a separate change record. The mask without its targets would
+            be unsafe: replayed against every stroke on the page it would also erase ink drawn later.
+
+            These are **inert ids, not references**. An id naming no stored stroke is normal and must
+            stay harmless: a target recoloured after the operation was made reaches a client in a
+            later delta page than the operation naming it, and a target the client's own retention
+            has purged never arrives at all. A client that enforced them would stall its cursor
+            permanently on either case.
+
+    InkEraseFields:
+      type: object
+      additionalProperties: true
+      required: [pageId, mode, sizeDp, points, createdAt]
+      description: One eraser gesture, stored so it can be replayed rather than applied to the strokes it cuts.
+      properties:
+        pageId:
+          type: string
+          maxLength: 512
+        mode:
+          type: string
+          maxLength: 128
+          description: |
+            `Normal` subtracts the mask; `Object` removes every disconnected component it touches.
+            Stored as text and never checked against a list, so a new eraser mode does not need a
+            server deploy before it can be stored.
+        sizeDp:
+          type: number
+          format: float
+          description: Eraser diameter in page dp.
+        points:
+          type: string
+          format: byte
+          description: The mask's encoded input path, base64, opaque to the server.
+        enc:
+          type: string
+          maxLength: 128
+        createdAt:
+          type: integer
+          format: int64
+
+    InkMoveFields:
+      type: object
+      additionalProperties: true
+      required: [pageId, dxDp, dyDp, points, createdAt]
+      description: |
+        One lasso transform, stored as its polygon and affine parameters rather than applied. The
+        strokes it moves are immutable: rewriting their points would invalidate every stored lasso
+        path that references the originals, and would put the whole selection back on the wire.
+      properties:
+        pageId:
+          type: string
+          maxLength: 512
+        dxDp:
+          type: number
+          format: float
+        dyDp:
+          type: number
+          format: float
+        scaleX:
+          type: number
+          format: float
+          description: Optional resize composed after the translation. A plain move stores 1.
+        scaleY:
+          type: number
+          format: float
+        anchorX:
+          type: number
+          format: float
+          description: Page-space anchor the resize is taken around.
+        anchorY:
+          type: number
+          format: float
+        points:
+          type: string
+          format: byte
+          description: The closed lasso polygon in page coordinates, base64, opaque to the server.
+        enc:
+          type: string
+          maxLength: 128
+        createdAt:
+          type: integer
+          format: int64
+
     NotebookChange:
       allOf:
         - $ref: "#/components/schemas/ChangeEnvelope"
@@ -952,6 +1155,23 @@ components:
         - $ref: "#/components/schemas/ChangeEnvelope"
         - $ref: "#/components/schemas/PageContentFields"
 
+    InkStrokeChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/InkStrokeFields"
+
+    InkEraseChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/InkEraseFields"
+        - $ref: "#/components/schemas/InkOperationTargets"
+
+    InkMoveChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/InkMoveFields"
+        - $ref: "#/components/schemas/InkOperationTargets"
+
     NotebookPush:
       allOf:
         - $ref: "#/components/schemas/PushChangeEnvelope"
@@ -971,6 +1191,23 @@ components:
       allOf:
         - $ref: "#/components/schemas/PushChangeEnvelope"
         - $ref: "#/components/schemas/PageContentFields"
+
+    InkStrokePush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/InkStrokeFields"
+
+    InkErasePush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/InkEraseFields"
+        - $ref: "#/components/schemas/InkOperationTargets"
+
+    InkMovePush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/InkMoveFields"
+        - $ref: "#/components/schemas/InkOperationTargets"
 
     RenameDeviceRequest:
       type: object
