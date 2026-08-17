@@ -198,6 +198,56 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /v1/devices/{deviceID}:
+    patch:
+      operationId: renameDevice
+      tags: [Devices]
+      summary: Rename a registered device
+      description: |
+        The target must belong to the authenticated account and must not be revoked: a revoked row
+        is history, and history that can be relabelled is worse than history. A device may rename
+        itself.
+
+        The name a client registers with is whatever it could work out about its own hardware, which
+        is regularly not enough to tell two devices apart — two Android emulators built from
+        different profiles report the same `Build.MODEL`, and so do two tablets of the same model.
+        The field is a label for whoever is deciding which device to revoke, so this endpoint exists
+        to let them write it.
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: "#/components/parameters/DeviceID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameDeviceRequest"
+      responses:
+        "204":
+          description: Device renamed. The response has no body.
+        "400":
+          description: The name is empty, too long, or holds a NUL character.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: invalid_request
+                message: a device name is required
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          description: No matching live device exists for the authenticated account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: not_found
+                message: no such device
+        "500":
+          $ref: "#/components/responses/InternalError"
+
     delete:
       operationId: revokeDevice
       tags: [Devices]
@@ -921,6 +971,17 @@ components:
       allOf:
         - $ref: "#/components/schemas/PushChangeEnvelope"
         - $ref: "#/components/schemas/PageContentFields"
+
+    RenameDeviceRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Trimmed before storage. What the device list will show for this device.
 
     ErrorResponse:
       type: object

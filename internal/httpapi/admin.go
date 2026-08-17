@@ -37,6 +37,7 @@ type adminStore interface {
 	AuthenticateAdminSession(ctx context.Context, tokenHash []byte) (store.Account, error)
 	DeleteAdminSession(ctx context.Context, tokenHash []byte) error
 	ListDevices(ctx context.Context, accountID string) ([]store.Device, error)
+	RenameDevice(ctx context.Context, accountID string, deviceID string, name string) error
 	RevokeDevice(ctx context.Context, accountID string, deviceID string) error
 }
 
@@ -76,6 +77,10 @@ func (database postgresAdminStore) ListDevices(ctx context.Context, accountID st
 	return store.ListDevices(ctx, database.pool, accountID)
 }
 
+func (database postgresAdminStore) RenameDevice(ctx context.Context, accountID string, deviceID string, name string) error {
+	return store.RenameDevice(ctx, database.pool, accountID, deviceID, name)
+}
+
 func (database postgresAdminStore) RevokeDevice(ctx context.Context, accountID string, deviceID string) error {
 	return store.RevokeDevice(ctx, database.pool, accountID, deviceID)
 }
@@ -100,6 +105,7 @@ func (application adminApplication) handler(pool *pgxpool.Pool) http.Handler {
 	mux.HandleFunc("POST /logout", application.handleLogout)
 	mux.HandleFunc("GET /admin", application.handleDashboard)
 	mux.HandleFunc("GET /admin/logs", application.handleLiveLogs)
+	mux.HandleFunc("POST /admin/devices/{deviceID}/rename", application.handleRenameDevice)
 	mux.HandleFunc("POST /admin/devices/{deviceID}/revoke", application.handleRevokeDevice)
 
 	return withAdminSecurityHeaders(withPanicRecovery(withRequestLogging(mux, application.logger), application.logger))
@@ -339,6 +345,49 @@ func (application adminApplication) handleDashboard(w http.ResponseWriter, r *ht
 		Devices:           views,
 		CSRFToken:         adminCSRFToken(plainSessionToken),
 	})
+}
+
+// handleRenameDevice relabels a device from the dashboard.
+//
+// Same shape as revoking — session, CSRF, account-scoped store call, redirect — because it is the
+// same kind of action on the same row. It is here because the dashboard is the one place that shows
+// every device at once, which is exactly where two rows called "Pixel Tablet" are a problem.
+func (application adminApplication) handleRenameDevice(w http.ResponseWriter, r *http.Request) {
+	account, plainSessionToken, ok := application.requireAdminSession(w, r)
+	if !ok {
+		return
+	}
+	if !parseAdminForm(w, r) || !constantTimeTokenMatch(adminCSRFToken(plainSessionToken), r.PostFormValue("csrf_token")) {
+		application.writeAdminPage(w, http.StatusForbidden, adminErrorTemplate, adminErrorPageData{
+			Title:   "Request expired",
+			Message: "Return to the dashboard and try again.",
+		})
+		return
+	}
+
+	name, err := validateDeviceName(r.PostFormValue("name"))
+	if err != nil {
+		application.writeAdminPage(w, http.StatusBadRequest, adminErrorTemplate, adminErrorPageData{
+			Title:   "That name will not do",
+			Message: err.Error() + ".",
+		})
+		return
+	}
+
+	deviceID := r.PathValue("deviceID")
+	if err := application.store.RenameDevice(r.Context(), account.ID, deviceID, name); err != nil {
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			application.writeAdminPage(w, http.StatusNotFound, adminErrorTemplate, adminErrorPageData{
+				Title:   "Device not found",
+				Message: "That device does not exist for this account, or has been revoked.",
+			})
+			return
+		}
+		application.writeAdminError(w, "Could not rename the device.", "renaming a device from admin failed", err)
+		return
+	}
+	application.logger.Info("device renamed from admin panel", "account_id", account.ID, "device_id", deviceID)
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
 func (application adminApplication) handleRevokeDevice(w http.ResponseWriter, r *http.Request) {

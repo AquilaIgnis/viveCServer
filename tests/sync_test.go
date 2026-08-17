@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -659,5 +660,53 @@ func TestABodyWithoutItsPageIsRejectedNotStored(t *testing.T) {
 	}
 	if result.Cursor != 0 {
 		t.Fatalf("cursor = %d, want a batch that changed nothing to allocate nothing", result.Cursor)
+	}
+}
+
+// TestADeviceCanBeRenamedAndARevokedOneCannot: the name a client registers with is all it knew
+// about itself, and two devices of the same model report the same thing. Renaming is how a person
+// tells the rows apart before deciding which to revoke.
+func TestADeviceCanBeRenamedAndARevokedOneCannot(t *testing.T) {
+	fixture := newSyncFixture(t)
+	tablet := fixture.registerDevice("Pixel Tablet")
+	other := fixture.registerDevice("Pixel Tablet")
+
+	status := fixture.request(http.MethodPatch, "/v1/devices/"+other.deviceID, tablet.token,
+		map[string]any{"name": "Studio tablet"}, nil)
+	if status != http.StatusNoContent {
+		t.Fatalf("rename status = %d, want 204", status)
+	}
+
+	var listed struct {
+		Devices []struct {
+			DeviceID string `json:"deviceId"`
+			Name     string `json:"name"`
+		} `json:"devices"`
+	}
+	fixture.request(http.MethodGet, "/v1/devices", tablet.token, nil, &listed)
+	renamed := false
+	for _, device := range listed.Devices {
+		if device.DeviceID == other.deviceID && device.Name == "Studio tablet" {
+			renamed = true
+		}
+	}
+	if !renamed {
+		t.Fatalf("device list = %+v, want the renamed device", listed.Devices)
+	}
+
+	// An empty name would leave a row nothing can be said about.
+	if status := fixture.request(http.MethodPatch, "/v1/devices/"+other.deviceID, tablet.token,
+		map[string]any{"name": "   "}, nil); status != http.StatusBadRequest {
+		t.Fatalf("blank rename status = %d, want 400", status)
+	}
+
+	// A revoked row is history. Relabelling it would make the log of what happened disagree with
+	// what is written next to it.
+	if status := fixture.request(http.MethodDelete, "/v1/devices/"+other.deviceID, tablet.token, nil, nil); status != http.StatusNoContent {
+		t.Fatalf("revoke status = %d, want 204", status)
+	}
+	if status := fixture.request(http.MethodPatch, "/v1/devices/"+other.deviceID, tablet.token,
+		map[string]any{"name": "Renamed after the fact"}, nil); status != http.StatusNotFound {
+		t.Fatalf("renaming a revoked device = %d, want 404", status)
 	}
 }

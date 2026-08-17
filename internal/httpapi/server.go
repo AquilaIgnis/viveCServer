@@ -42,13 +42,16 @@ func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) ht
 
 	// Everything else requires a device token.
 	mux.Handle("GET /v1/devices", authenticated(handleListDevices(pool, logger)))
+	mux.Handle("PATCH /v1/devices/{deviceID}", authenticated(handleRenameDevice(pool, logger)))
 	mux.Handle("DELETE /v1/devices/{deviceID}", authenticated(handleRevokeDevice(pool, logger)))
 
 	mux.Handle("GET /v1/cursor", authenticated(handleReadCursor(pool, logger)))
 	mux.Handle("GET /v1/changes", authenticated(handlePullChanges(pool, logger)))
 	mux.Handle("POST /v1/changes", authenticated(handlePushChanges(pool, logger, options.BatchReplayWindow)))
 
-	return withPanicRecovery(withRequestLogging(mux, logger), logger)
+	// Compression sits inside the logger so the log records the status the handler chose, and
+	// inside recovery so a panic in a compressed response still becomes a 500.
+	return withPanicRecovery(withRequestLogging(withCompression(mux, logger), logger), logger)
 }
 
 // NewAdminHandler builds the browser-only setup and administration surface. It intentionally does

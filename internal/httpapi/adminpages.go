@@ -189,6 +189,12 @@ const dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
             <small>Registered {{.CreatedAt}}{{if .RevokedAt}} · Revoked {{.RevokedAt}}{{end}}</small>
           </div>
           {{if .Active}}
+          <form method="post" action="/admin/devices/{{.ID}}/rename" class="device-rename">
+            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+            <label class="visually-hidden" for="rename-{{.ID}}">Name for this device</label>
+            <input id="rename-{{.ID}}" type="text" name="name" value="{{.Name}}" maxlength="128" required>
+            <button type="submit">Rename</button>
+          </form>
           <form method="post" action="/admin/devices/{{.ID}}/revoke">
             <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
             <button type="submit" class="button-danger">Revoke</button>
@@ -301,6 +307,12 @@ button:hover, .button-link:hover { filter: brightness(1.08); }
 .device-main p, .device-main small { margin: .25rem 0 0; color: var(--muted); font-size: .8rem; }
 .device-state { padding: .15rem .45rem; border-radius: 999px; color: var(--muted); background: #ffffff0a; font-size: .65rem; font-weight: 800; text-transform: uppercase; }
 .device-state.active { color: var(--accent); background: #72e6a510; }
+/* The rename field sizes to its own content rather than taking the shared full-width input rule, so
+   a device row stays a row: the point of renaming is to tell two rows apart at a glance. */
+.device-rename { display: flex; align-items: center; gap: .5rem; }
+.device-rename input { width: 12rem; min-height: 2.35rem; padding: .45rem .7rem; font-size: .85rem; }
+.device-rename button { min-height: 2.35rem; border: 1px solid var(--border); color: var(--text); background: var(--surface-raised); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .empty-state { padding: 4rem 1rem; color: var(--muted); text-align: center; }
 .empty-state > span { color: var(--accent); font-size: 2rem; }
 .empty-state p { margin: 0; }

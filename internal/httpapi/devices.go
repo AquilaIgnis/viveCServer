@@ -161,6 +161,56 @@ func handleListDevices(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 	}
 }
 
+type renameDeviceRequest struct {
+	Name string `json:"name"`
+}
+
+// handleRenameDevice relabels a device, including the calling device's own.
+//
+// The name a client registers with is whatever it could work out about the hardware, and that is
+// regularly not enough to tell two devices apart — two Android emulators built from different
+// profiles report the same `Build.MODEL`, and so do two real tablets of the same model. The field
+// exists so a person can tell which row to revoke, so the fix for an ambiguous one is to let them
+// write it rather than to invent a better guess.
+func handleRenameDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		caller, ok := authenticatedDeviceOrFail(w, r, logger)
+		if !ok {
+			return
+		}
+
+		var request renameDeviceRequest
+		if !decodeJSONRequest(w, r, logger, maxAuthRequestBytes, &request) {
+			return
+		}
+		name, err := validateDeviceName(request.Name)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, codeInvalidRequest, err.Error())
+			return
+		}
+
+		targetDeviceID := r.PathValue("deviceID")
+		if err := store.RenameDevice(r.Context(), pool, caller.AccountID, targetDeviceID, name); err != nil {
+			if errors.Is(err, store.ErrDeviceNotFound) {
+				// 404 for another account's device, for the same reason revocation does it: a 403
+				// would confirm that the id exists.
+				writeError(w, logger, http.StatusNotFound, codeNotFound, "no such device")
+				return
+			}
+			writeInternalError(w, logger, "renaming a device failed", err)
+			return
+		}
+
+		logger.Info("device renamed",
+			"account_id", caller.AccountID,
+			"device_id", targetDeviceID,
+			"renamed_by", caller.DeviceID,
+			"self", targetDeviceID == caller.DeviceID,
+		)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 // handleRevokeDevice makes a device's token stop working, including the calling device's own.
 func handleRevokeDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

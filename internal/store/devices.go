@@ -125,6 +125,36 @@ func ListDevices(ctx context.Context, pool *pgxpool.Pool, accountID string) ([]D
 	return devices, nil
 }
 
+// RenameDevice changes what a device is called, and nothing else about it.
+//
+// The name a device registers with is whatever the client could work out about the hardware, which
+// is not always enough to tell two of them apart: two Android emulators built from different
+// profiles can report the same `Build.MODEL`, and so can two real tablets of the same model. The
+// name is only ever a label for the person deciding which row to revoke, so letting them write it is
+// the whole feature.
+//
+// Scoped to the account like every other device operation, and it will not rename a revoked device:
+// that row is history, and history that can be relabelled is worse than history.
+func RenameDevice(ctx context.Context, pool *pgxpool.Pool, accountID string, deviceID string, name string) error {
+	if !IsUUID(deviceID) {
+		return ErrDeviceNotFound
+	}
+
+	const statement = `
+		UPDATE devices
+		SET name = $3
+		WHERE id = $1::uuid AND account_id = $2::uuid AND revoked_at IS NULL`
+
+	result, err := pool.Exec(ctx, statement, deviceID, accountID, name)
+	if err != nil {
+		return fmt.Errorf("renaming a device: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrDeviceNotFound
+	}
+	return nil
+}
+
 // RevokeDevice marks a device unusable. It is scoped to the account so one account can never revoke
 // another's device, and re-revoking an already revoked device is not an error — the caller asked for
 // a state, and the state holds.

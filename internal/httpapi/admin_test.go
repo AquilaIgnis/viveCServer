@@ -25,6 +25,7 @@ type fakeAdminStore struct {
 	sessions     map[string]string
 	devices      []store.Device
 	revokedID    string
+	renamedID    string
 }
 
 func (database *fakeAdminStore) CountAccounts(context.Context) (int64, error) {
@@ -82,6 +83,21 @@ func (database *fakeAdminStore) ListDevices(_ context.Context, accountID string)
 		return nil, errors.New("wrong account")
 	}
 	return database.devices, nil
+}
+
+func (database *fakeAdminStore) RenameDevice(_ context.Context, accountID string, deviceID string, name string) error {
+	if accountID != database.account.ID {
+		return store.ErrDeviceNotFound
+	}
+	for index := range database.devices {
+		// Revoked rows are not renameable: history that can be relabelled is worse than history.
+		if database.devices[index].ID == deviceID && database.devices[index].RevokedAt == nil {
+			database.devices[index].Name = name
+			database.renamedID = deviceID
+			return nil
+		}
+	}
+	return store.ErrDeviceNotFound
 }
 
 func (database *fakeAdminStore) RevokeDevice(_ context.Context, accountID string, deviceID string) error {
@@ -232,6 +248,60 @@ func TestAdminCanRevokeADevice(t *testing.T) {
 	handler.ServeHTTP(revokeResponse, revokeRequest)
 	if revokeResponse.Code != http.StatusSeeOther || database.revokedID == "" {
 		t.Fatalf("revoke response = %d, revoked id = %q", revokeResponse.Code, database.revokedID)
+	}
+}
+
+// TestDevicesCanBeRenamedFromTheDashboard: the dashboard is the one place that shows every device
+// at once, which is where two rows reporting the same `Build.MODEL` become a problem — and the
+// only place to fix it, since the name a client registers with is all it knew about itself.
+func TestDevicesCanBeRenamedFromTheDashboard(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		devices: []store.Device{
+			{ID: "20000000-0000-0000-0000-000000000002", Name: "Pixel Tablet", Platform: "Android 15"},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	form := url.Values{"csrf_token": {adminCSRFToken(plainToken)}, "name": {"Studio tablet"}}
+	request := httptest.NewRequest(http.MethodPost, "/admin/devices/20000000-0000-0000-0000-000000000002/rename", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusSeeOther || database.devices[0].Name != "Studio tablet" {
+		t.Fatalf("rename response = %d, stored name = %q", response.Code, database.devices[0].Name)
+	}
+
+	// Without the CSRF token it is somebody else's form post, and the name must not move.
+	forged := url.Values{"name": {"Renamed by a stranger"}}
+	forgedRequest := httptest.NewRequest(http.MethodPost, "/admin/devices/20000000-0000-0000-0000-000000000002/rename", strings.NewReader(forged.Encode()))
+	forgedRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	forgedRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	forgedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(forgedResponse, forgedRequest)
+
+	if forgedResponse.Code != http.StatusForbidden || database.devices[0].Name != "Studio tablet" {
+		t.Fatalf("forged rename = %d, stored name = %q", forgedResponse.Code, database.devices[0].Name)
+	}
+
+	// An empty name would leave a row nothing can be said about, so it is refused rather than stored.
+	blank := url.Values{"csrf_token": {adminCSRFToken(plainToken)}, "name": {"   "}}
+	blankRequest := httptest.NewRequest(http.MethodPost, "/admin/devices/20000000-0000-0000-0000-000000000002/rename", strings.NewReader(blank.Encode()))
+	blankRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	blankRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	blankResponse := httptest.NewRecorder()
+	handler.ServeHTTP(blankResponse, blankRequest)
+
+	if blankResponse.Code != http.StatusBadRequest || database.devices[0].Name != "Studio tablet" {
+		t.Fatalf("blank rename = %d, stored name = %q", blankResponse.Code, database.devices[0].Name)
 	}
 }
 
