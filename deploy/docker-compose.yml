@@ -36,7 +36,6 @@ services:
       - '${VIVE_SYNC_PORT:-5444}:8281'
     # The server migrates on startup, so it must not race PostgreSQL's first boot. Waiting for
     # healthy rather than started is the difference between a clean `up` and one that fails on the
-    # first run and works on the second.
     depends_on:
       postgres:
         condition: service_healthy

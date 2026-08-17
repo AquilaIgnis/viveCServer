@@ -1,8 +1,13 @@
-# Development override: build the server from the working tree instead of pulling Docker Hub.
-#
-#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up --build
+# Development override: build the server from the working tree instead of pulling Docker Hub
+# docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up --build
 
 services:
+  postgres:
+    # Docker writes its own iptables rules that reaches the LAN even behind a host firewall.
+    # Set VIVE_POSTGRES_BIND=0.0.0.0 to opt into that deliberately.
+    ports:
+      - '${VIVE_POSTGRES_BIND:-127.0.0.1}:${VIVE_POSTGRES_PORT:-5432}:5432'
+
   vivecserver:
     build:
       context: ..
