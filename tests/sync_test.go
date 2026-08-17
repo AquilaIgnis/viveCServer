@@ -1,6 +1,9 @@
 package tests
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -543,5 +546,118 @@ func TestAnEmptyPushIsCheapAndHarmless(t *testing.T) {
 	}
 	if empty.Cursor != before {
 		t.Fatalf("empty push moved the cursor from %d to %d", before, empty.Cursor)
+	}
+}
+
+// TestADocumentBodyRoundTripsThroughTheServer is S3's first exit criterion: a page's document
+// reaches another device byte for byte, through a server that never looks inside it.
+func TestADocumentBodyRoundTripsThroughTheServer(t *testing.T) {
+	fixture := newSyncFixture(t)
+	tablet := fixture.registerDevice("tablet")
+	phone := fixture.registerDevice("phone")
+
+	// Bytes that are not text, so a round trip proves base64 rather than a string copy: a NUL, a
+	// 0xff no UTF-8 decoder would accept, and a newline where PostgreSQL's own base64 puts one.
+	doc := append([]byte("{\"schema\":3,\"o\":\"hello\"}\x00\xff\n"), make([]byte, 200)...)
+
+	pushed := tablet.push(
+		notebookChange("notebook-1", 0, "Work"),
+		sectionChange("section-1", 0, "notebook-1", "Meetings"),
+		pageChange("page-1", 0, "section-1", "Monday"),
+		pageContentChange("page-1", 0, doc),
+	)
+	if len(pushed.Applied) != 4 || len(pushed.Rejected) != 0 {
+		t.Fatalf("push applied %d rejected %+v, want 4 and none", len(pushed.Applied), pushed.Rejected)
+	}
+
+	changes, _ := phone.pullEverything(0, 0)
+	kinds := make([]string, 0, len(changes))
+	for _, change := range changes {
+		kinds = append(kinds, change["kind"].(string))
+	}
+	if fmt.Sprint(kinds) != "[notebook section page pageContent]" {
+		t.Fatalf("pull order = %v, want a body after the page it hangs from", kinds)
+	}
+
+	body := changeOfKind(t, changes, "pageContent")
+	returned, err := base64.StdEncoding.DecodeString(body["doc"].(string))
+	if err != nil {
+		t.Fatalf("doc did not decode as base64: %v", err)
+	}
+	if !bytes.Equal(returned, doc) {
+		t.Fatalf("doc came back as %d bytes, want the %d that were sent", len(returned), len(doc))
+	}
+
+	digest := sha256.Sum256(doc)
+	if body["docSha256"] != base64.StdEncoding.EncodeToString(digest[:]) {
+		t.Fatalf("docSha256 = %v, want the digest of what was stored", body["docSha256"])
+	}
+	if body["pageId"] != "page-1" || body["format"] != "json/1" {
+		t.Fatalf("body = %+v, want it addressed to page-1 in json/1", body)
+	}
+	// Absent on the push, so the server supplies what a client that has never heard of encodings
+	// means by leaving it out.
+	if body["enc"] != "none/1" {
+		t.Fatalf("enc = %v, want the default", body["enc"])
+	}
+}
+
+// TestABodyThatDoesNotMatchItsDigestIsRefused: a truncated document must be a rejected entity, not
+// a document that decodes to nothing on every device that pulls it.
+func TestABodyThatDoesNotMatchItsDigestIsRefused(t *testing.T) {
+	fixture := newSyncFixture(t)
+	tablet := fixture.registerDevice("tablet")
+
+	tablet.push(
+		notebookChange("notebook-1", 0, "Work"),
+		sectionChange("section-1", 0, "notebook-1", "Meetings"),
+		pageChange("page-1", 0, "section-1", "Monday"),
+	)
+
+	lying := pageContentChange("page-1", 0, []byte("the body that was actually sent"))
+	claimed := sha256.Sum256([]byte("a different body entirely"))
+	lying["docSha256"] = claimed[:]
+
+	// Pushed with a page rename beside it, so the test also shows the rejection is per entity.
+	result := tablet.push(lying, pageChange("page-1", 1, "section-1", "Tuesday"))
+	if len(result.Rejected) != 1 || result.Rejected[0].Reason != syncengine.ReasonMalformed {
+		t.Fatalf("rejected = %+v, want one malformed body", result.Rejected)
+	}
+	if len(result.Applied) != 1 || result.Applied[0].Kind != "page" {
+		t.Fatalf("applied = %+v, want the page beside it to land", result.Applied)
+	}
+}
+
+// TestADocumentLargerThanTheCapIsRefused holds the line the batch cap cannot: a body is bounded on
+// its own, before base64 turns 2 MiB into nearly 3 MB of request.
+func TestADocumentLargerThanTheCapIsRefused(t *testing.T) {
+	fixture := newSyncFixture(t)
+	tablet := fixture.registerDevice("tablet")
+
+	tablet.push(
+		notebookChange("notebook-1", 0, "Work"),
+		sectionChange("section-1", 0, "notebook-1", "Meetings"),
+		pageChange("page-1", 0, "section-1", "Monday"),
+	)
+
+	huge := pageContentChange("page-1", 0, make([]byte, (2<<20)+1))
+	result := tablet.push(huge)
+	if len(result.Rejected) != 1 || result.Rejected[0].Reason != syncengine.ReasonTooLarge {
+		t.Fatalf("rejected = %+v, want one too_large body", result.Rejected)
+	}
+}
+
+// TestABodyWithoutItsPageIsRejectedNotStored: `page_content` hangs off `pages` with a real foreign
+// key, so the parent check is what keeps a client bug from being a failed transaction.
+func TestABodyWithoutItsPageIsRejectedNotStored(t *testing.T) {
+	fixture := newSyncFixture(t)
+	tablet := fixture.registerDevice("tablet")
+
+	result := tablet.push(pageContentChange("page-that-does-not-exist", 0, []byte("{}")))
+	if len(result.Rejected) != 1 || result.Rejected[0].Reason != syncengine.ReasonMissingParent {
+		t.Fatalf("rejected = %+v, want one missing_parent", result.Rejected)
+	}
+	if result.Cursor != 0 {
+		t.Fatalf("cursor = %d, want a batch that changed nothing to allocate nothing", result.Cursor)
 	}
 }

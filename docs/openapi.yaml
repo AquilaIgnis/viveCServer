@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.2.0
+  version: 0.3.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -19,9 +19,11 @@ info:
     server-assigned `version`, a push states the version it believes it is editing, and a push that
     lost the race comes back with the current server state rather than overwriting it.
 
-    Document bodies, ink, and attachment blobs are separate entity kinds arriving in server phases
-    S3-S5. They are not implemented and are deliberately absent from this contract. Add them here
-    when their handlers ship so generated clients never treat planned operations as available ones.
+    Document bodies are the `pageContent` kind (S3): opaque bytes with a codec id and a checksum,
+    which the server stores and returns without ever parsing. Ink and attachment blobs are separate
+    kinds arriving in S4-S5. They are not implemented and are deliberately absent from this
+    contract. Add them here when their handlers ship so generated clients never treat planned
+    operations as available ones.
 
 servers:
   - url: http://localhost:5444
@@ -676,11 +678,12 @@ components:
 
     EntityKind:
       type: string
-      description: Synced entity kinds. Document bodies, ink, and attachments join this list in S3-S5.
+      description: Synced entity kinds. Ink and attachments join this list in S4-S5.
       enum:
         - notebook
         - section
         - page
+        - pageContent
 
     ChangeEnvelope:
       type: object
@@ -752,12 +755,14 @@ components:
         - $ref: "#/components/schemas/NotebookChange"
         - $ref: "#/components/schemas/SectionChange"
         - $ref: "#/components/schemas/PageChange"
+        - $ref: "#/components/schemas/PageContentChange"
       discriminator:
         propertyName: kind
         mapping:
           notebook: "#/components/schemas/NotebookChange"
           section: "#/components/schemas/SectionChange"
           page: "#/components/schemas/PageChange"
+          pageContent: "#/components/schemas/PageContentChange"
 
     PushChange:
       description: |
@@ -767,12 +772,14 @@ components:
         - $ref: "#/components/schemas/NotebookPush"
         - $ref: "#/components/schemas/SectionPush"
         - $ref: "#/components/schemas/PagePush"
+        - $ref: "#/components/schemas/PageContentPush"
       discriminator:
         propertyName: kind
         mapping:
           notebook: "#/components/schemas/NotebookPush"
           section: "#/components/schemas/SectionPush"
           page: "#/components/schemas/PagePush"
+          pageContent: "#/components/schemas/PageContentPush"
 
     NotebookFields:
       type: object
@@ -835,10 +842,45 @@ components:
         preview:
           type: string
           maxLength: 4096
-          description: Denormalised first line of body text. The document itself syncs in S3.
+          description: Denormalised first line of body text, carried by the page so that listing a section never loads a document. The document itself is the `pageContent` kind.
         createdAt:
           type: integer
           format: int64
+
+    PageContentFields:
+      type: object
+      additionalProperties: true
+      required: [pageId, doc, format]
+      properties:
+        pageId:
+          type: string
+          maxLength: 512
+          description: |
+            The page this body belongs to, which must already exist on the account or arrive earlier
+            in the same batch. One body per page is enforced by the server; a client addresses a body
+            by its page's id.
+        doc:
+          type: string
+          format: byte
+          description: |
+            The document, base64 encoded, opaque to the server. At most 2 MiB before encoding — a
+            larger one is rejected `too_large`, because a batch is capped at 4 MB and base64 costs a
+            third on top of the bytes.
+        docSha256:
+          type: string
+          format: byte
+          description: |
+            SHA-256 of `doc`, base64 encoded. Optional on a push and always present on a pull. When a
+            push carries one it is verified rather than trusted, and a body that disagrees with it is
+            rejected `malformed`; the stored digest is always recomputed from the bytes that arrived.
+        format:
+          type: string
+          maxLength: 128
+          description: Id of the codec that wrote `doc`, per row, so the format can change without rewriting every document. `json/1` today.
+        enc:
+          type: string
+          maxLength: 128
+          description: How `doc` is wrapped before storage. Absent means `none/1`, which is what the server returns.
 
     NotebookChange:
       allOf:
@@ -855,6 +897,11 @@ components:
         - $ref: "#/components/schemas/ChangeEnvelope"
         - $ref: "#/components/schemas/PageFields"
 
+    PageContentChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/PageContentFields"
+
     NotebookPush:
       allOf:
         - $ref: "#/components/schemas/PushChangeEnvelope"
@@ -869,6 +916,11 @@ components:
       allOf:
         - $ref: "#/components/schemas/PushChangeEnvelope"
         - $ref: "#/components/schemas/PageFields"
+
+    PageContentPush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/PageContentFields"
 
     ErrorResponse:
       type: object

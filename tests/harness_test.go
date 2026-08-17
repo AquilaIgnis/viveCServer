@@ -385,3 +385,31 @@ func pageChange(id string, baseVersion int64, sectionID string, title string) ma
 		"createdAt":   1_700_000_000_000,
 	}
 }
+
+// pageContentChange addresses a body by its page's id, which is what the app does: `pageId` is the
+// primary key of its own `page_content` table. `doc` is a []byte so that `encoding/json` base64s it
+// exactly as a real client's serializer will.
+func pageContentChange(pageID string, baseVersion int64, doc []byte) map[string]any {
+	return map[string]any{
+		"kind":        "pageContent",
+		"id":          pageID,
+		"baseVersion": baseVersion,
+		"updatedAt":   1_700_000_000_000,
+		"pageId":      pageID,
+		"doc":         doc,
+		"format":      "json/1",
+	}
+}
+
+// changeOfKind finds the one change of a kind in a delta. Bodies share their page's id, so indexing
+// a delta by id alone cannot tell a page from the document hanging off it.
+func changeOfKind(t *testing.T, changes []map[string]any, kind string) map[string]any {
+	t.Helper()
+	for _, change := range changes {
+		if change["kind"] == kind {
+			return change
+		}
+	}
+	t.Fatalf("no %q change in the delta", kind)
+	return nil
+}

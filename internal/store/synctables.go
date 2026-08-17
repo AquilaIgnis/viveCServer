@@ -166,6 +166,14 @@ var syncKinds = []*SyncKind{
 		changeJSON: pageChangeJSON,
 		newFields:  func() EntityFields { return &PageFields{} },
 	},
+	{
+		Name:       "pageContent",
+		Rank:       3,
+		Table:      "page_content",
+		ParentKind: "page",
+		changeJSON: pageContentChangeJSON,
+		newFields:  func() EntityFields { return &PageContentFields{} },
+	},
 }
 
 var syncKindsByName = func() map[string]*SyncKind {
@@ -442,6 +450,15 @@ type DeltaRow struct {
 	Change    json.RawMessage
 }
 
+// MaxDeltaBytes is the budget one pull response spends on rows before it stops at the next sequence
+// boundary.
+//
+// Comfortably above one push (4 MB, §7) plus what base64 adds, so it never cuts inside the work of
+// a single client and only ever draws the line between two of them. Lower would make a large push
+// unpullable; much higher would put the server's memory at the mercy of how many documents an
+// account happens to have changed since a device was last on wifi.
+const MaxDeltaBytes = 8 << 20
+
 // selectDeltaStatement is built once from the registry: one branch per kind, unioned and ordered
 // globally so a client receives parents before children within each sequence value.
 var selectDeltaStatement = func() string {
@@ -466,6 +483,10 @@ var selectDeltaStatement = func() string {
 // The upper bound is not an optimisation. A caller that read the cursor first and then queried
 // without it would miss a push that committed in between: the cursor it returns would sit above
 // rows the client never received, and the client would never ask for them again.
+// It also stops early once the rows read pass [MaxDeltaBytes], reporting that it did so. A row
+// count stopped bounding a response the moment `page_content` joined the registry: 512 documents is
+// a number, not a size, and a client asking for a page of them could ask the server to hold
+// hundreds of megabytes in memory to answer once (R1).
 func SelectDelta(
 	ctx context.Context,
 	database Querier,
@@ -473,25 +494,37 @@ func SelectDelta(
 	sinceCursor int64,
 	upperBound int64,
 	limit int,
-) ([]DeltaRow, error) {
+) (delta []DeltaRow, stoppedForBytes bool, err error) {
 	rows, err := database.Query(ctx, selectDeltaStatement, accountID, sinceCursor, upperBound, limit)
 	if err != nil {
-		return nil, fmt.Errorf("reading a change delta: %w", err)
+		return nil, false, fmt.Errorf("reading a change delta: %w", err)
 	}
 	defer rows.Close()
 
-	delta := make([]DeltaRow, 0, min(limit, 512))
+	delta = make([]DeltaRow, 0, min(limit, 512))
+	spent := 0
 	for rows.Next() {
 		var row DeltaRow
 		if err := rows.Scan(&row.ChangeSeq, &row.Change); err != nil {
-			return nil, fmt.Errorf("reading a change delta: %w", err)
+			return nil, false, fmt.Errorf("reading a change delta: %w", err)
 		}
+
+		// Over budget, but only ever stopping where one sequence value ends and the next begins:
+		// SD2 makes a sequence a batch boundary, and a response that ended inside one would let a
+		// client acknowledge half of a push and never see the rest. A single push that exceeds the
+		// budget by itself is therefore returned whole — bounded by the push cap, which is what
+		// bounds this in the end.
+		if spent >= MaxDeltaBytes && len(delta) > 0 && row.ChangeSeq != delta[len(delta)-1].ChangeSeq {
+			return delta, true, nil
+		}
+
+		spent += len(row.Change)
 		delta = append(delta, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("reading a change delta: %w", err)
+		return nil, false, fmt.Errorf("reading a change delta: %w", err)
 	}
-	return delta, nil
+	return delta, false, nil
 }
 
 // FindAppliedBatchResponse returns the stored response for a batch the device already pushed.

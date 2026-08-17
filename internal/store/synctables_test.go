@@ -34,7 +34,11 @@ func TestEveryKindRendersEveryFieldItStores(t *testing.T) {
 // TestRenderedKeysAreAllRecognised is the same check in reverse, so a typo in a rendering
 // expression cannot invent a field name no client is looking for.
 func TestRenderedKeysAreAllRecognised(t *testing.T) {
-	quotedToken := regexp.MustCompile(`'([A-Za-z][A-Za-z0-9_]*)'`)
+	// Key position only — a quoted token followed by a comma, which is what every argument pair in
+	// `jsonb_build_object` looks like. Matching every quoted token instead would read the argument
+	// of a SQL function as a key the moment a kind renders through one, as `page_content` does with
+	// `encode(doc, 'base64')`.
+	quotedToken := regexp.MustCompile(`'([A-Za-z][A-Za-z0-9_]*)'\s*,`)
 
 	for _, kind := range SyncKindsInApplyOrder() {
 		for _, match := range quotedToken.FindAllStringSubmatch(kind.changeJSON, -1) {

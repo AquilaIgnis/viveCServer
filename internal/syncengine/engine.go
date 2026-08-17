@@ -284,12 +284,19 @@ func PullChanges(
 	}
 
 	// One row past the limit, purely to learn whether there are more.
-	delta, err := store.SelectDelta(ctx, pool, accountID, sinceCursor, upperBound, limit+1)
+	delta, stoppedForBytes, err := store.SelectDelta(ctx, pool, accountID, sinceCursor, upperBound, limit+1)
 	if err != nil {
 		return PullResult{}, err
 	}
-	if len(delta) <= limit {
+	if len(delta) <= limit && !stoppedForBytes {
 		return PullResult{Changes: changesOf(delta), Cursor: upperBound, HasMore: false}, nil
+	}
+	if len(delta) <= limit {
+		// Fewer rows than the client asked for, and still not everything: the delta ran into the
+		// byte budget instead. It already ends where a sequence value does, so the last one read is
+		// the cursor and the client comes back for the rest.
+		cursor := delta[len(delta)-1].ChangeSeq
+		return PullResult{Changes: changesOf(delta), Cursor: cursor, HasMore: cursor < upperBound}, nil
 	}
 
 	// There is more than one page of delta, so the response has to stop at a sequence boundary. A
@@ -306,7 +313,7 @@ func PullChanges(
 		// A single push is larger than the page the client asked for. Returning it whole is the
 		// only answer that lets the client advance at all, which makes `limit` a request rather
 		// than a cap. It is bounded by the push limit, not by the client's number.
-		wholeSequence, err := store.SelectDelta(ctx, pool, accountID, overflowSeq-1, overflowSeq, MaxChangesPerBatch+1)
+		wholeSequence, _, err := store.SelectDelta(ctx, pool, accountID, overflowSeq-1, overflowSeq, MaxChangesPerBatch+1)
 		if err != nil {
 			return PullResult{}, err
 		}
