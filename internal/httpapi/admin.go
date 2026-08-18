@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -26,6 +27,11 @@ const (
 	adminSessionLifetime   = 30 * 24 * time.Hour
 	formCSRFLifetime       = 10 * time.Minute
 	maxAdminFormBytes      = 64 * 1024
+
+	// How many notebook names the dashboard will render at once. The list is a disclosure inside a
+	// statistics tile, not an inventory screen: past a few hundred names it stops being readable
+	// before it stops being cheap, so the page says how many it left out instead of growing.
+	maxDashboardNotebooks = 250
 )
 
 type adminStore interface {
@@ -39,6 +45,9 @@ type adminStore interface {
 	ListDevices(ctx context.Context, accountID string) ([]store.Device, error)
 	RenameDevice(ctx context.Context, accountID string, deviceID string, name string) error
 	RevokeDevice(ctx context.Context, accountID string, deviceID string) error
+	DeleteRevokedDevice(ctx context.Context, accountID string, deviceID string) error
+	DeleteRevokedDevices(ctx context.Context, accountID string) (int64, error)
+	NotebookOverview(ctx context.Context, accountID string, limit int) (int64, []store.NotebookSummary, error)
 }
 
 type postgresAdminStore struct {
@@ -85,6 +94,18 @@ func (database postgresAdminStore) RevokeDevice(ctx context.Context, accountID s
 	return store.RevokeDevice(ctx, database.pool, accountID, deviceID)
 }
 
+func (database postgresAdminStore) DeleteRevokedDevice(ctx context.Context, accountID string, deviceID string) error {
+	return store.DeleteRevokedDevice(ctx, database.pool, accountID, deviceID)
+}
+
+func (database postgresAdminStore) DeleteRevokedDevices(ctx context.Context, accountID string) (int64, error) {
+	return store.DeleteRevokedDevices(ctx, database.pool, accountID)
+}
+
+func (database postgresAdminStore) NotebookOverview(ctx context.Context, accountID string, limit int) (int64, []store.NotebookSummary, error) {
+	return store.NotebookOverview(ctx, database.pool, accountID, limit)
+}
+
 type adminApplication struct {
 	store    adminStore
 	logger   *slog.Logger
@@ -95,8 +116,9 @@ func (application adminApplication) handler(pool *pgxpool.Pool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleLiveness())
 	mux.HandleFunc("GET /readyz", handleReadiness(pool, application.logger))
-	mux.HandleFunc("GET /assets/admin.css", application.handleStylesheet)
-	mux.HandleFunc("GET /assets/admin.js", application.handleAdminScript)
+	// Registered from the same values the pages link to, so the router and the markup cannot drift.
+	mux.HandleFunc("GET "+adminStylesheetPath, application.handleStylesheet)
+	mux.HandleFunc("GET "+adminScriptPath, application.handleAdminScript)
 	mux.HandleFunc("GET /{$}", application.handleRoot)
 	mux.HandleFunc("GET /setup", application.handleSetupPage)
 	mux.HandleFunc("POST /setup", application.handleSetup)
@@ -107,6 +129,10 @@ func (application adminApplication) handler(pool *pgxpool.Pool) http.Handler {
 	mux.HandleFunc("GET /admin/logs", application.handleLiveLogs)
 	mux.HandleFunc("POST /admin/devices/{deviceID}/rename", application.handleRenameDevice)
 	mux.HandleFunc("POST /admin/devices/{deviceID}/revoke", application.handleRevokeDevice)
+	// Registered before the wildcard is irrelevant to routing -- a literal segment always beats a
+	// pattern in Go's mux -- but it reads in the order the operator meets the two buttons.
+	mux.HandleFunc("POST /admin/devices/remove-revoked", application.handleRemoveRevokedDevices)
+	mux.HandleFunc("POST /admin/devices/{deviceID}/remove", application.handleRemoveDevice)
 
 	return withAdminSecurityHeaders(withPanicRecovery(withRequestLogging(mux, application.logger), application.logger))
 }
@@ -336,13 +362,35 @@ func (application adminApplication) handleDashboard(w http.ResponseWriter, r *ht
 		})
 	}
 
+	notebookCount, notebooks, err := application.store.NotebookOverview(r.Context(), account.ID, maxDashboardNotebooks)
+	if err != nil {
+		application.writeAdminError(w, "Could not load synced notebooks.", "listing notebooks for admin failed", err)
+		return
+	}
+	notebookViews := make([]adminNotebookView, 0, len(notebooks))
+	for _, notebook := range notebooks {
+		notebookViews = append(notebookViews, adminNotebookView{
+			Name:      notebook.Name,
+			UpdatedAt: formatAdminTime(notebook.ServerUpdatedAt),
+		})
+	}
+
 	application.writeAdminPage(w, http.StatusOK, adminDashboardTemplate, dashboardPageData{
-		Email:             account.Email,
-		CreatedAt:         formatAdminTime(account.CreatedAt),
-		Storage:           formatByteCount(account.StorageBytes),
-		ActiveDeviceCount: activeDeviceCount,
-		DeviceCount:       len(devices),
-		Devices:           views,
+		Email:              account.Email,
+		CreatedAt:          formatAdminTime(account.CreatedAt),
+		Storage:            formatByteCount(account.StorageBytes),
+		ActiveDeviceCount:  activeDeviceCount,
+		DeviceCount:        len(devices),
+		RevokedDeviceCount: len(devices) - activeDeviceCount,
+		Devices:            views,
+		NotebookCount:      notebookCount,
+		Notebooks:          notebookViews,
+		// Only ever positive when an account has more notebooks than the page will render, which
+		// the list says out loud rather than quietly showing a prefix of the truth.
+		HiddenNotebookCount: notebookCount - int64(len(notebookViews)),
+		// Anything that is not the notebooks tab is the devices tab, so a mangled or missing value
+		// lands on the panel the operator came for rather than on an error.
+		NotebooksSelected: r.URL.Query().Get("tab") == "notebooks",
 		CSRFToken:         adminCSRFToken(plainSessionToken),
 	})
 }
@@ -387,7 +435,7 @@ func (application adminApplication) handleRenameDevice(w http.ResponseWriter, r 
 		return
 	}
 	application.logger.Info("device renamed from admin panel", "account_id", account.ID, "device_id", deviceID)
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	redirectToDevice(w, r, deviceID)
 }
 
 func (application adminApplication) handleRevokeDevice(w http.ResponseWriter, r *http.Request) {
@@ -416,7 +464,78 @@ func (application adminApplication) handleRevokeDevice(w http.ResponseWriter, r 
 		return
 	}
 	application.logger.Info("device revoked from admin panel", "account_id", account.ID, "device_id", deviceID)
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	redirectToDevice(w, r, deviceID)
+}
+
+// handleRemoveDevice deletes a revoked device row for good.
+//
+// Revocation already did the security work, and it did it permanently: the row exists only so the
+// dashboard can say what happened. This is the tidying that follows, for the operator whose device
+// list is mostly phones they no longer own. Live devices are not removable here — revoke is the
+// button for those, and it is one row up.
+func (application adminApplication) handleRemoveDevice(w http.ResponseWriter, r *http.Request) {
+	account, plainSessionToken, ok := application.requireAdminSession(w, r)
+	if !ok {
+		return
+	}
+	if !parseAdminForm(w, r) || !constantTimeTokenMatch(adminCSRFToken(plainSessionToken), r.PostFormValue("csrf_token")) {
+		application.writeAdminPage(w, http.StatusForbidden, adminErrorTemplate, adminErrorPageData{
+			Title:   "Request expired",
+			Message: "Return to the dashboard and try again.",
+		})
+		return
+	}
+
+	deviceID := r.PathValue("deviceID")
+	err := application.store.DeleteRevokedDevice(r.Context(), account.ID, deviceID)
+	if errors.Is(err, store.ErrDeviceStillActive) {
+		application.writeAdminPage(w, http.StatusConflict, adminErrorTemplate, adminErrorPageData{
+			Title:   "That device is still active",
+			Message: "Revoke it first. Removing a device that is still in use would disconnect it without saying so.",
+		})
+		return
+	}
+	if errors.Is(err, store.ErrDeviceNotFound) {
+		application.writeAdminPage(w, http.StatusNotFound, adminErrorTemplate, adminErrorPageData{
+			Title:   "Device not found",
+			Message: "That device does not exist for this account. It may already have been removed.",
+		})
+		return
+	}
+	if err != nil {
+		application.writeAdminError(w, "Could not remove the device.", "removing a revoked device from admin failed", err)
+		return
+	}
+	application.logger.Info("revoked device removed from admin panel", "account_id", account.ID, "device_id", deviceID)
+	// The row this came from no longer exists, so the list itself is the closest place to land.
+	redirectToDeviceList(w, r)
+}
+
+// handleRemoveRevokedDevices clears every revoked row at once.
+//
+// One button per row means a list that accumulates faster than it is cleared, which is how a
+// dashboard stops being read at all. Removing none is a success: the operator asked for a list with
+// no revoked devices in it, and that is what they get.
+func (application adminApplication) handleRemoveRevokedDevices(w http.ResponseWriter, r *http.Request) {
+	account, plainSessionToken, ok := application.requireAdminSession(w, r)
+	if !ok {
+		return
+	}
+	if !parseAdminForm(w, r) || !constantTimeTokenMatch(adminCSRFToken(plainSessionToken), r.PostFormValue("csrf_token")) {
+		application.writeAdminPage(w, http.StatusForbidden, adminErrorTemplate, adminErrorPageData{
+			Title:   "Request expired",
+			Message: "Return to the dashboard and try again.",
+		})
+		return
+	}
+
+	removedCount, err := application.store.DeleteRevokedDevices(r.Context(), account.ID)
+	if err != nil {
+		application.writeAdminError(w, "Could not remove the revoked devices.", "removing revoked devices from admin failed", err)
+		return
+	}
+	application.logger.Info("revoked devices removed from admin panel", "account_id", account.ID, "removed_count", removedCount)
+	redirectToDeviceList(w, r)
 }
 
 func (application adminApplication) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -537,6 +656,21 @@ func (application adminApplication) writeAdminError(w http.ResponseWriter, messa
 		Title:   "Something went wrong",
 		Message: message,
 	})
+}
+
+// redirectToDevice sends a completed device action back to the row it acted on.
+//
+// Redirecting to a bare /admin reloads the dashboard at the top of the page, which throws away the
+// operator's place in a list they were working down -- revoke the fourth device and you are looking
+// at the hero heading, hunting for where you were. The fragment is the whole fix, and it costs a
+// redirect target rather than any script.
+func redirectToDevice(w http.ResponseWriter, r *http.Request, deviceID string) {
+	http.Redirect(w, r, "/admin?tab=devices#device-"+url.PathEscape(deviceID), http.StatusSeeOther)
+}
+
+// redirectToDeviceList lands on the panel rather than a row, for actions that removed the row.
+func redirectToDeviceList(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/admin?tab=devices#contents", http.StatusSeeOther)
 }
 
 func parseAdminForm(w http.ResponseWriter, r *http.Request) bool {

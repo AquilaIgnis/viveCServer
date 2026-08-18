@@ -2,10 +2,16 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"html/template"
 	"log/slog"
 	"net/http"
 )
+
+// assetCacheControl is as aggressive as it is only because the paths carry a content digest: a
+// stale copy can never be served against markup that did not ship with it.
+const assetCacheControl = "public, max-age=31536000, immutable"
 
 type setupPageData struct {
 	CSRFToken string
@@ -30,14 +36,27 @@ type adminDeviceView struct {
 	Active     bool
 }
 
+// adminNotebookView is one notebook name on the dashboard. Ids are deliberately absent: they are
+// client-generated opaque strings that mean nothing to the person reading the list, and the
+// timestamp is what actually tells two notebooks with the same name apart.
+type adminNotebookView struct {
+	Name      string
+	UpdatedAt string
+}
+
 type dashboardPageData struct {
-	Email             string
-	CreatedAt         string
-	Storage           string
-	ActiveDeviceCount int
-	DeviceCount       int
-	Devices           []adminDeviceView
-	CSRFToken         string
+	Email               string
+	CreatedAt           string
+	Storage             string
+	ActiveDeviceCount   int
+	DeviceCount         int
+	RevokedDeviceCount  int
+	Devices             []adminDeviceView
+	NotebookCount       int64
+	Notebooks           []adminNotebookView
+	HiddenNotebookCount int64
+	NotebooksSelected   bool
+	CSRFToken           string
 }
 
 type adminErrorPageData struct {
@@ -77,26 +96,43 @@ func (application adminApplication) writeAdminPage(w http.ResponseWriter, status
 
 func (application adminApplication) handleStylesheet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("Cache-Control", assetCacheControl)
 	_, _ = w.Write([]byte(adminStylesheet))
 }
 
 func (application adminApplication) handleAdminScript(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("Cache-Control", assetCacheControl)
 	_, _ = w.Write([]byte(adminScript))
 }
 
-const pageHead = `<!doctype html>
+// The admin assets are served under a path containing a digest of what they hold.
+//
+// A fixed path plus a cache lifetime is a trap for an upgradeable product: the pages are no-store,
+// so a rebuilt server sends new markup immediately, while the browser keeps answering the old
+// stylesheet out of cache. New class names against an old stylesheet is not a subtle degradation --
+// it is an unstyled page, and it lasts until the cache entry expires. The digest makes that
+// impossible: changed content is a changed URL, which cannot be in any cache yet.
+var (
+	adminStylesheetPath = contentAddressedPath("admin", "css", adminStylesheet)
+	adminScriptPath     = contentAddressedPath("admin", "js", adminScript)
+)
+
+func contentAddressedPath(name string, extension string, content string) string {
+	digest := sha256.Sum256([]byte(content))
+	return "/assets/" + name + "." + hex.EncodeToString(digest[:6]) + "." + extension
+}
+
+var pageHead = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <link rel="stylesheet" href="/assets/admin.css">
+  <link rel="stylesheet" href="` + adminStylesheetPath + `">
 `
 
-const setupPageHTML = pageHead + `<title>Set up viveCServer</title>
+var setupPageHTML = pageHead + `<title>Set up viveCServer</title>
 </head>
 <body class="centered-page">
   <main class="auth-shell">
@@ -124,7 +160,7 @@ const setupPageHTML = pageHead + `<title>Set up viveCServer</title>
 </body>
 </html>`
 
-const loginPageHTML = pageHead + `<title>Sign in · viveCServer</title>
+var loginPageHTML = pageHead + `<title>Sign in · viveCServer</title>
 </head>
 <body class="centered-page">
   <main class="auth-shell">
@@ -148,8 +184,8 @@ const loginPageHTML = pageHead + `<title>Sign in · viveCServer</title>
 </body>
 </html>`
 
-const dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
-  <script src="/assets/admin.js" defer></script>
+var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
+  <script src="` + adminScriptPath + `" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -173,18 +209,31 @@ const dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
       <article class="metric"><span>Synced storage</span><strong>{{.Storage}}</strong><small>Attachment blobs</small></article>
       <article class="metric"><span>Account created</span><strong class="metric-date">{{.CreatedAt}}</strong><small>Owner account</small></article>
     </section>
-    <section class="panel">
-      <div class="panel-heading">
-        <div><p class="eyebrow">Access</p><h2>Registered devices</h2></div>
-        <span class="count-badge">{{.DeviceCount}}</span>
+    <section class="panel" id="contents">
+      <div class="panel-heading tabbed">
+        <!-- Real links, not scripted buttons. Without the script they still work: the server reads
+             ?tab= and renders the same page with the other panel showing. -->
+        <nav class="tab-strip" data-tab-strip aria-label="Server contents">
+          <a class="tab{{if not .NotebooksSelected}} is-selected{{end}}" href="/admin?tab=devices" data-tab="devices"{{if not .NotebooksSelected}} aria-current="page"{{end}}>Devices <span class="count-badge">{{.DeviceCount}}</span></a>
+          <a class="tab{{if .NotebooksSelected}} is-selected{{end}}" href="/admin?tab=notebooks" data-tab="notebooks"{{if .NotebooksSelected}} aria-current="page"{{end}}>Notebooks <span class="count-badge">{{.NotebookCount}}</span></a>
+        </nav>
+        <div class="panel-actions" data-panel="devices"{{if .NotebooksSelected}} hidden{{end}}>
+          {{if .RevokedDeviceCount}}
+          <form method="post" action="/admin/devices/remove-revoked">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <button type="submit" class="button-secondary button-small">Remove {{.RevokedDeviceCount}} revoked</button>
+          </form>
+          {{end}}
+        </div>
       </div>
+      <div data-panel="devices"{{if .NotebooksSelected}} hidden{{end}}>
       {{if .Devices}}
-      <div class="device-list">
+      <div class="record-list">
         {{range .Devices}}
-        <article class="device-row">
-          <div class="device-icon" aria-hidden="true">◆</div>
-          <div class="device-main">
-            <div class="device-title"><strong>{{.Name}}</strong>{{if .Active}}<span class="device-state active">Active</span>{{else}}<span class="device-state">Revoked</span>{{end}}</div>
+        <article class="record-row" id="device-{{.ID}}">
+          <div class="record-icon" aria-hidden="true">◆</div>
+          <div class="record-main">
+            <div class="record-title"><strong>{{.Name}}</strong>{{if .Active}}<span class="record-state active">Active</span>{{else}}<span class="record-state">Revoked</span>{{end}}</div>
             <p>{{if .Platform}}{{.Platform}} · {{end}}Last seen {{.LastSeenAt}}</p>
             <small>Registered {{.CreatedAt}}{{if .RevokedAt}} · Revoked {{.RevokedAt}}{{end}}</small>
           </div>
@@ -199,6 +248,11 @@ const dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
             <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
             <button type="submit" class="button-danger">Revoke</button>
           </form>
+          {{else}}
+          <form method="post" action="/admin/devices/{{.ID}}/remove">
+            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+            <button type="submit" class="button-danger">Remove</button>
+          </form>
           {{end}}
         </article>
         {{end}}
@@ -206,6 +260,25 @@ const dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
       {{else}}
       <div class="empty-state"><span aria-hidden="true">◇</span><h3>No devices yet</h3><p>Connect viveNotes to the sync port to register the first device.</p></div>
       {{end}}
+      </div>
+      <div data-panel="notebooks"{{if not .NotebooksSelected}} hidden{{end}}>
+      {{if .Notebooks}}
+      <div class="record-list">
+        {{range .Notebooks}}
+        <article class="record-row">
+          <div class="record-icon" aria-hidden="true">▤</div>
+          <div class="record-main">
+            <div class="record-title"><strong>{{.Name}}</strong></div>
+            <p>Last changed {{.UpdatedAt}}</p>
+          </div>
+        </article>
+        {{end}}
+      </div>
+      {{if .HiddenNotebookCount}}<p class="list-note">{{.HiddenNotebookCount}} more not shown.</p>{{end}}
+      {{else}}
+      <div class="empty-state"><span aria-hidden="true">◇</span><h3>No notebooks yet</h3><p>Notebooks appear here once a device syncs them to this server.</p></div>
+      {{end}}
+      </div>
     </section>
     <section class="panel live-log-panel" aria-labelledby="live-log-title">
       <div class="panel-heading">
@@ -225,7 +298,7 @@ const dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
 </body>
 </html>`
 
-const errorPageHTML = pageHead + `<title>{{.Title}} · viveCServer</title>
+var errorPageHTML = pageHead + `<title>{{.Title}} · viveCServer</title>
 </head>
 <body class="centered-page">
   <main class="auth-shell compact">
@@ -294,19 +367,36 @@ button:hover, .button-link:hover { filter: brightness(1.08); }
 .metric span, .metric small { color: var(--muted); font-size: .78rem; }
 .metric strong { margin-top: auto; font-size: 2rem; letter-spacing: -.04em; }
 .metric strong.metric-date { font-size: 1.05rem; letter-spacing: -.015em; }
+.list-note { margin: 0; padding: 0 1.35rem 1.2rem; color: var(--muted); font-size: .76rem; }
+.panel-actions { display: flex; align-items: center; gap: .75rem; }
+/* The tab strip is the panel's title: "Devices" and "Notebooks" name their own contents better than
+   a heading above them could, so the heading loses its eyebrow and h2 and carries these instead. */
+.panel-heading.tabbed { padding: .8rem 1rem .8rem .9rem; }
+.tab-strip { display: flex; gap: .3rem; }
+.tab { display: inline-flex; align-items: center; gap: .55rem; padding: .5rem .8rem; border: 1px solid transparent; border-radius: .75rem; color: var(--muted); font-size: 1rem; font-weight: 800; letter-spacing: -.02em; text-decoration: none; }
+.tab:hover { color: var(--text); background: #ffffff06; }
+.tab.is-selected { border-color: var(--border); color: var(--text); background: var(--surface-raised); }
+.tab .count-badge { min-width: 1.7rem; height: 1.7rem; color: var(--muted); background: #ffffff0a; font-size: .72rem; }
+.tab.is-selected .count-badge { color: var(--accent); background: #72e6a513; }
+/* A class that sets a display value outranks the browser's own [hidden] rule, and the panel actions
+   carry one. Without this, hiding them on the notebooks tab would not hide them. */
+[hidden] { display: none !important; }
 .panel { overflow: hidden; border: 1px solid var(--border); border-radius: 1rem; background: var(--surface); }
 .panel + .panel { margin-top: 1rem; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; padding: 1.35rem; border-bottom: 1px solid var(--border); }
 .count-badge { display: grid; min-width: 2rem; height: 2rem; place-items: center; border-radius: 999px; color: var(--accent); background: #72e6a513; font-size: .8rem; font-weight: 850; }
-.device-list { display: grid; }
-.device-row { display: flex; align-items: center; gap: 1rem; padding: 1.15rem 1.35rem; }
-.device-row + .device-row { border-top: 1px solid var(--border); }
-.device-icon { display: grid; flex: 0 0 2.5rem; height: 2.5rem; place-items: center; border-radius: .7rem; color: var(--accent); background: #72e6a510; }
-.device-main { min-width: 0; flex: 1; }
-.device-title { display: flex; align-items: center; gap: .65rem; }
-.device-main p, .device-main small { margin: .25rem 0 0; color: var(--muted); font-size: .8rem; }
-.device-state { padding: .15rem .45rem; border-radius: 999px; color: var(--muted); background: #ffffff0a; font-size: .65rem; font-weight: 800; text-transform: uppercase; }
-.device-state.active { color: var(--accent); background: #72e6a510; }
+/* One row shape for both tabs. A notebook and a device are different things, but a list of them is
+   the same list, and switching tabs should not feel like switching pages. */
+.record-list { display: grid; }
+.record-row { display: flex; align-items: center; gap: 1rem; padding: 1.15rem 1.35rem; }
+.record-row + .record-row { border-top: 1px solid var(--border); }
+.record-icon { display: grid; flex: 0 0 2.5rem; height: 2.5rem; place-items: center; border-radius: .7rem; color: var(--accent); background: #72e6a510; }
+.record-main { min-width: 0; flex: 1; }
+.record-title { display: flex; align-items: center; gap: .65rem; }
+.record-title strong { overflow-wrap: anywhere; }
+.record-main p, .record-main small { margin: .25rem 0 0; color: var(--muted); font-size: .8rem; }
+.record-state { padding: .15rem .45rem; border-radius: 999px; color: var(--muted); background: #ffffff0a; font-size: .65rem; font-weight: 800; text-transform: uppercase; }
+.record-state.active { color: var(--accent); background: #72e6a510; }
 /* The rename field sizes to its own content rather than taking the shared full-width input rule, so
    a device row stays a row: the point of renaming is to tell two rows apart at a glance. */
 .device-rename { display: flex; align-items: center; gap: .5rem; }
@@ -341,9 +431,13 @@ button:hover, .button-link:hover { filter: brightness(1.08); }
   .hero { display: grid; }
   .metric-grid { grid-template-columns: 1fr; }
   .metric { min-height: 7rem; }
-  .device-row { align-items: flex-start; flex-wrap: wrap; }
-  .device-row form { width: 100%; padding-left: 3.5rem; }
-  .device-row button { width: 100%; }
+  .panel-heading.tabbed { align-items: stretch; flex-direction: column; gap: .75rem; }
+  .tab { flex: 1; justify-content: center; }
+  .panel-actions { align-items: stretch; flex-direction: column; }
+  .panel-actions button { width: 100%; }
+  .record-row { align-items: flex-start; flex-wrap: wrap; }
+  .record-row form { width: 100%; padding-left: 3.5rem; }
+  .record-row button { width: 100%; }
   .live-log-panel .panel-heading { align-items: flex-start; gap: 1rem; }
   .log-actions { align-items: flex-end; flex-direction: column; }
   .log-row { grid-template-columns: 1fr 4rem; gap: .25rem .7rem; }
@@ -356,6 +450,44 @@ button:hover, .button-link:hover { filter: brightness(1.08); }
 const adminScript = `
 (() => {
   "use strict";
+
+  // Tabs. The links work without this -- the server reads ?tab= and renders the same page with the
+  // other panel showing -- so all this adds is doing it without a round trip, which also means the
+  // page does not jump back to the top on every switch.
+  const tabStrip = document.querySelector("[data-tab-strip]");
+  if (tabStrip) {
+    const tabs = Array.from(tabStrip.querySelectorAll("[data-tab]"));
+    const panels = Array.from(document.querySelectorAll("[data-panel]"));
+
+    function showTab(name) {
+      for (const tab of tabs) {
+        const selected = tab.dataset.tab === name;
+        tab.classList.toggle("is-selected", selected);
+        if (selected) {
+          tab.setAttribute("aria-current", "page");
+        } else {
+          tab.removeAttribute("aria-current");
+        }
+      }
+      for (const panel of panels) {
+        panel.hidden = panel.dataset.panel !== name;
+      }
+    }
+
+    for (const tab of tabs) {
+      tab.addEventListener("click", (event) => {
+        // Leave a modified click alone: it is somebody opening the tab in a new window.
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+          return;
+        }
+        event.preventDefault();
+        showTab(tab.dataset.tab);
+        // replaceState rather than pushState: switching tabs is not a place in history to go back
+        // to, but a reload -- or the redirect after revoking a device -- should return here.
+        history.replaceState(null, "", tab.href);
+      });
+    }
+  }
 
   const output = document.getElementById("live-log-output");
   const status = document.getElementById("live-log-status");

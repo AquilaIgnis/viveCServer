@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -24,8 +26,10 @@ type fakeAdminStore struct {
 	account      store.Account
 	sessions     map[string]string
 	devices      []store.Device
+	notebooks    []store.NotebookSummary
 	revokedID    string
 	renamedID    string
+	removedIDs   []string
 }
 
 func (database *fakeAdminStore) CountAccounts(context.Context) (int64, error) {
@@ -115,6 +119,52 @@ func (database *fakeAdminStore) RevokeDevice(_ context.Context, accountID string
 	return store.ErrDeviceNotFound
 }
 
+func (database *fakeAdminStore) DeleteRevokedDevice(_ context.Context, accountID string, deviceID string) error {
+	if accountID != database.account.ID {
+		return store.ErrDeviceNotFound
+	}
+	for index := range database.devices {
+		if database.devices[index].ID != deviceID {
+			continue
+		}
+		if database.devices[index].RevokedAt == nil {
+			return store.ErrDeviceStillActive
+		}
+		database.devices = append(database.devices[:index], database.devices[index+1:]...)
+		database.removedIDs = append(database.removedIDs, deviceID)
+		return nil
+	}
+	return store.ErrDeviceNotFound
+}
+
+func (database *fakeAdminStore) DeleteRevokedDevices(_ context.Context, accountID string) (int64, error) {
+	if accountID != database.account.ID {
+		return 0, errors.New("wrong account")
+	}
+	kept := make([]store.Device, 0, len(database.devices))
+	var removedCount int64
+	for _, device := range database.devices {
+		if device.RevokedAt == nil {
+			kept = append(kept, device)
+			continue
+		}
+		database.removedIDs = append(database.removedIDs, device.ID)
+		removedCount++
+	}
+	database.devices = kept
+	return removedCount, nil
+}
+
+func (database *fakeAdminStore) NotebookOverview(_ context.Context, accountID string, limit int) (int64, []store.NotebookSummary, error) {
+	if accountID != database.account.ID {
+		return 0, nil, errors.New("wrong account")
+	}
+	if len(database.notebooks) > limit {
+		return int64(len(database.notebooks)), database.notebooks[:limit], nil
+	}
+	return int64(len(database.notebooks)), database.notebooks, nil
+}
+
 func newAdminTestHandler(database adminStore) http.Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return adminApplication{store: database, logger: logger}.handler(nil)
@@ -175,7 +225,7 @@ func TestFirstRunSetupCreatesOwnerAndSignsIn(t *testing.T) {
 		t.Fatal("admin response is missing its Content-Security-Policy")
 	}
 	if !strings.Contains(dashboard.Body.String(), `id="live-log-output"`) ||
-		!strings.Contains(dashboard.Body.String(), `src="/assets/admin.js"`) {
+		!strings.Contains(dashboard.Body.String(), `src="`+adminScriptPath+`"`) {
 		t.Fatal("dashboard is missing the live log panel or its browser script")
 	}
 }
@@ -302,6 +352,382 @@ func TestDevicesCanBeRenamedFromTheDashboard(t *testing.T) {
 
 	if blankResponse.Code != http.StatusBadRequest || database.devices[0].Name != "Studio tablet" {
 		t.Fatalf("blank rename = %d, stored name = %q", blankResponse.Code, database.devices[0].Name)
+	}
+}
+
+// TestRevokedDevicesCanBeRemovedFromTheDashboard: revocation is permanent on its own, so the row
+// that survives it is a record, not a control. Once the operator has read it, the only thing left
+// to do with a phone they no longer own is stop looking at it.
+func TestRevokedDevicesCanBeRemovedFromTheDashboard(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedAt := time.Now()
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		devices: []store.Device{
+			{ID: "20000000-0000-0000-0000-000000000002", Name: "Old phone", RevokedAt: &revokedAt},
+			{ID: "20000000-0000-0000-0000-000000000003", Name: "Studio tablet"},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	dashboard := httptest.NewRecorder()
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	dashboardRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(dashboard, dashboardRequest)
+	if !strings.Contains(dashboard.Body.String(), `/admin/devices/20000000-0000-0000-0000-000000000002/remove`) {
+		t.Fatal("the revoked device has no Remove control on the dashboard")
+	}
+	if strings.Contains(dashboard.Body.String(), `/admin/devices/20000000-0000-0000-0000-000000000003/remove`) {
+		t.Fatal("an active device was offered a Remove control")
+	}
+
+	// A stale page's forged post must not delete anything, in either direction.
+	forged := httptest.NewRequest(http.MethodPost, "/admin/devices/20000000-0000-0000-0000-000000000002/remove", strings.NewReader(""))
+	forged.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	forged.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	forgedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(forgedResponse, forged)
+	if forgedResponse.Code != http.StatusForbidden || len(database.devices) != 2 {
+		t.Fatalf("forged removal = %d, devices left = %d", forgedResponse.Code, len(database.devices))
+	}
+
+	// An active device is refused rather than quietly disconnected.
+	form := url.Values{"csrf_token": {adminCSRFToken(plainToken)}}
+	activeRequest := httptest.NewRequest(http.MethodPost, "/admin/devices/20000000-0000-0000-0000-000000000003/remove", strings.NewReader(form.Encode()))
+	activeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	activeRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	activeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(activeResponse, activeRequest)
+	if activeResponse.Code != http.StatusConflict || len(database.devices) != 2 {
+		t.Fatalf("removing an active device = %d, devices left = %d", activeResponse.Code, len(database.devices))
+	}
+
+	removeRequest := httptest.NewRequest(http.MethodPost, "/admin/devices/20000000-0000-0000-0000-000000000002/remove", strings.NewReader(form.Encode()))
+	removeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	removeRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	removeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(removeResponse, removeRequest)
+	if removeResponse.Code != http.StatusSeeOther || len(database.devices) != 1 {
+		t.Fatalf("removal = %d, devices left = %d", removeResponse.Code, len(database.devices))
+	}
+	if database.devices[0].ID != "20000000-0000-0000-0000-000000000003" {
+		t.Fatalf("removal took the wrong row: %q survived", database.devices[0].ID)
+	}
+
+	// Removing it a second time is a 404 rather than a 500: the row is already gone.
+	repeatRequest := httptest.NewRequest(http.MethodPost, "/admin/devices/20000000-0000-0000-0000-000000000002/remove", strings.NewReader(form.Encode()))
+	repeatRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	repeatRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	repeatResponse := httptest.NewRecorder()
+	handler.ServeHTTP(repeatResponse, repeatRequest)
+	if repeatResponse.Code != http.StatusNotFound {
+		t.Fatalf("repeat removal = %d, want 404", repeatResponse.Code)
+	}
+}
+
+// TestAllRevokedDevicesCanBeClearedAtOnce: one button per row means a list nobody finishes
+// clearing, so the panel heading offers to take all of them and leaves every live device alone.
+func TestAllRevokedDevicesCanBeClearedAtOnce(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedAt := time.Now()
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		devices: []store.Device{
+			{ID: "20000000-0000-0000-0000-000000000002", Name: "Old phone", RevokedAt: &revokedAt},
+			{ID: "20000000-0000-0000-0000-000000000003", Name: "Studio tablet"},
+			{ID: "20000000-0000-0000-0000-000000000004", Name: "Lost tablet", RevokedAt: &revokedAt},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	dashboard := httptest.NewRecorder()
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	dashboardRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(dashboard, dashboardRequest)
+	if !strings.Contains(dashboard.Body.String(), "Remove 2 revoked") {
+		t.Fatal("the dashboard did not offer to clear the revoked devices, or miscounted them")
+	}
+
+	form := url.Values{"csrf_token": {adminCSRFToken(plainToken)}}
+	request := httptest.NewRequest(http.MethodPost, "/admin/devices/remove-revoked", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusSeeOther || len(database.devices) != 1 {
+		t.Fatalf("bulk removal = %d, devices left = %d", response.Code, len(database.devices))
+	}
+	if database.devices[0].ID != "20000000-0000-0000-0000-000000000003" {
+		t.Fatalf("bulk removal took a live device: %q survived", database.devices[0].ID)
+	}
+
+	// With nothing revoked the offer disappears, and the endpoint stays harmless if it is posted
+	// to anyway -- the operator asked for a list with no revoked rows and that is already true.
+	clearedDashboard := httptest.NewRecorder()
+	clearedRequest := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	clearedRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(clearedDashboard, clearedRequest)
+	if strings.Contains(clearedDashboard.Body.String(), "revoked</button>") {
+		t.Fatal("the bulk removal button survived an empty revoked list")
+	}
+
+	repeat := httptest.NewRecorder()
+	repeatRequest := httptest.NewRequest(http.MethodPost, "/admin/devices/remove-revoked", strings.NewReader(form.Encode()))
+	repeatRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	repeatRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(repeat, repeatRequest)
+	if repeat.Code != http.StatusSeeOther || len(database.devices) != 1 {
+		t.Fatalf("repeat bulk removal = %d, devices left = %d", repeat.Code, len(database.devices))
+	}
+}
+
+// TestDashboardCountsAndNamesNotebooks: the count is the question the operator asks first and the
+// names are the follow-up, so both are on the page and the names are one click away rather than
+// one request away.
+func TestDashboardCountsAndNamesNotebooks(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := time.Date(2026, 8, 17, 9, 30, 0, 0, time.UTC)
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		notebooks: []store.NotebookSummary{
+			{ID: "nb-1", Name: "Field notes", ServerUpdatedAt: updatedAt},
+			{ID: "nb-2", Name: `<img src=x onerror="alert(1)">`, ServerUpdatedAt: updatedAt},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", response.Code)
+	}
+	if !strings.Contains(body, `data-tab="notebooks">Notebooks <span class="count-badge">2</span>`) {
+		t.Fatal("the notebooks tab did not show the count")
+	}
+	if !strings.Contains(body, "Field notes") {
+		t.Fatal("the notebook names are absent from the dashboard")
+	}
+	// The devices tab is what the dashboard opens on, so the notebook panel ships hidden.
+	if !strings.Contains(body, `<div data-panel="notebooks" hidden>`) {
+		t.Fatal("the notebooks panel is not hidden on the devices tab")
+	}
+	// A notebook name is user content that reached the server over sync, so it gets escaped like
+	// any other -- naming a notebook after a script tag must not make it one.
+	if strings.Contains(body, "<img src=x") {
+		t.Fatal("a notebook name was written without HTML escaping")
+	}
+	if !strings.Contains(body, "&lt;img src=x") {
+		t.Fatal("the escaped notebook name is missing")
+	}
+}
+
+// TestDashboardSaysHowManyNotebookNamesItLeftOut: the list is a disclosure in a statistics tile,
+// not an inventory screen, so it stops -- and says that it stopped rather than showing a prefix of
+// the truth as if it were all of it.
+func TestDashboardSaysHowManyNotebookNamesItLeftOut(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	notebooks := make([]store.NotebookSummary, maxDashboardNotebooks+3)
+	for index := range notebooks {
+		notebooks[index] = store.NotebookSummary{ID: fmt.Sprintf("nb-%d", index), Name: fmt.Sprintf("Notebook %d", index)}
+	}
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		notebooks:    notebooks,
+		sessions:     map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+
+	if !strings.Contains(body, fmt.Sprintf(`<span class="count-badge">%d</span>`, len(notebooks))) {
+		t.Fatal("the count reported only the rendered names rather than every notebook")
+	}
+	if !strings.Contains(body, "3 more not shown.") {
+		t.Fatal("the dashboard silently truncated the notebook list")
+	}
+}
+
+// TestTabsWorkWithoutTheBrowserScript: the tabs are links the server answers, not scripted
+// buttons, so switching works with the script blocked and the script only removes the round trip.
+func TestTabsWorkWithoutTheBrowserScript(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		devices:      []store.Device{{ID: "20000000-0000-0000-0000-000000000002", Name: "Studio tablet"}},
+		notebooks:    []store.NotebookSummary{{ID: "nb-1", Name: "Field notes"}},
+		sessions:     map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	fetch := func(path string) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200", path, response.Code)
+		}
+		return response.Body.String()
+	}
+
+	devicesTab := fetch("/admin")
+	if !strings.Contains(devicesTab, `<div data-panel="devices">`) || !strings.Contains(devicesTab, `<div data-panel="notebooks" hidden>`) {
+		t.Fatal("/admin did not open on the devices tab")
+	}
+
+	notebooksTab := fetch("/admin?tab=notebooks")
+	if !strings.Contains(notebooksTab, `<div data-panel="notebooks">`) || !strings.Contains(notebooksTab, `<div data-panel="devices" hidden>`) {
+		t.Fatal("?tab=notebooks did not switch the visible panel")
+	}
+	// Removing revoked devices is a device action, so its button has no business being on screen
+	// while the notebooks are.
+	if !strings.Contains(notebooksTab, `<div class="panel-actions" data-panel="devices" hidden>`) {
+		t.Fatal("the device actions stayed visible on the notebooks tab")
+	}
+
+	// A value nobody meant lands on the devices tab rather than on an error page.
+	if nonsense := fetch("/admin?tab=wat"); !strings.Contains(nonsense, `<div data-panel="devices">`) {
+		t.Fatal("an unrecognised tab did not fall back to devices")
+	}
+}
+
+// TestDeviceActionsReturnToTheRowTheyActedOn: a bare /admin redirect reloads at the top of the
+// page, so an operator working down a list loses their place on every click. This is the bug that
+// makes the panel annoying to actually use.
+func TestDeviceActionsReturnToTheRowTheyActedOn(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedAt := time.Now()
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		devices: []store.Device{
+			{ID: "20000000-0000-0000-0000-000000000002", Name: "Studio tablet"},
+			{ID: "20000000-0000-0000-0000-000000000003", Name: "Old phone", RevokedAt: &revokedAt},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	post := func(path string, form url.Values) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusSeeOther {
+			t.Fatalf("POST %s = %d, want 303", path, response.Code)
+		}
+		return response.Header().Get("Location")
+	}
+
+	csrf := url.Values{"csrf_token": {adminCSRFToken(plainToken)}}
+	rename := url.Values{"csrf_token": {adminCSRFToken(plainToken)}, "name": {"Studio tablet"}}
+
+	// Rename and revoke leave the row in place, so they land on it.
+	if location := post("/admin/devices/20000000-0000-0000-0000-000000000002/rename", rename); location != "/admin?tab=devices#device-20000000-0000-0000-0000-000000000002" {
+		t.Fatalf("rename redirected to %q, want the row it renamed", location)
+	}
+	if location := post("/admin/devices/20000000-0000-0000-0000-000000000002/revoke", csrf); location != "/admin?tab=devices#device-20000000-0000-0000-0000-000000000002" {
+		t.Fatalf("revoke redirected to %q, want the row it revoked", location)
+	}
+
+	// Removal deletes the row, so there is nothing to land on but the list.
+	if location := post("/admin/devices/20000000-0000-0000-0000-000000000003/remove", csrf); location != "/admin?tab=devices#contents" {
+		t.Fatalf("removal redirected to %q, want the device list", location)
+	}
+	if location := post("/admin/devices/remove-revoked", csrf); location != "/admin?tab=devices#contents" {
+		t.Fatalf("bulk removal redirected to %q, want the device list", location)
+	}
+}
+
+// TestAdminAssetsAreContentAddressed pins the fix for a genuinely nasty upgrade bug: the pages are
+// no-store, so a rebuilt server serves new markup at once, while a stylesheet at a fixed path stays
+// in the browser cache. New class names against the old stylesheet is not a subtle degradation, it
+// is an unstyled page, and it lasts until the cache entry expires.
+func TestAdminAssetsAreContentAddressed(t *testing.T) {
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+	}
+	handler := newAdminTestHandler(database)
+
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/login", nil))
+	linked := regexp.MustCompile(`href="(/assets/[^"]+\.css)"`).FindStringSubmatch(page.Body.String())
+	if linked == nil {
+		t.Fatalf("no stylesheet link in the page: %s", page.Body.String())
+	}
+	if linked[1] == "/assets/admin.css" {
+		t.Fatal("the stylesheet is still at a fixed path, so a stale cache can outlive an upgrade")
+	}
+
+	// Whatever the markup links to is what the router serves: the two are built from one value, and
+	// this is the assertion that keeps them that way.
+	asset := httptest.NewRecorder()
+	handler.ServeHTTP(asset, httptest.NewRequest(http.MethodGet, linked[1], nil))
+	if asset.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200", linked[1], asset.Code)
+	}
+	if !strings.Contains(asset.Body.String(), ".record-row") {
+		t.Fatal("the served stylesheet is not the one the pages are written against")
+	}
+	if cacheControl := asset.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "immutable") {
+		t.Fatalf("asset Cache-Control = %q, want an immutable cache now that the path carries a digest", cacheControl)
+	}
+}
+
+// TestContentAddressedPathTracksItsContent: the digest is the whole mechanism, so it has to change
+// when the bytes do and hold still when they do not.
+func TestContentAddressedPathTracksItsContent(t *testing.T) {
+	first := contentAddressedPath("admin", "css", "body { color: red }")
+	again := contentAddressedPath("admin", "css", "body { color: red }")
+	changed := contentAddressedPath("admin", "css", "body { color: blue }")
+
+	if first != again {
+		t.Fatalf("the same content produced %q and %q, so every restart would bust the cache", first, again)
+	}
+	if first == changed {
+		t.Fatal("changed content produced the same path, which is the bug this exists to prevent")
+	}
+	if !strings.HasPrefix(first, "/assets/admin.") || !strings.HasSuffix(first, ".css") {
+		t.Fatalf("path = %q, want it still recognisable as admin.css", first)
 	}
 }
 

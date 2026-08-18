@@ -189,3 +189,68 @@ func IsUUID(candidate string) bool {
 	var parsed pgtype.UUID
 	return parsed.Scan(candidate) == nil
 }
+
+// ErrDeviceStillActive is returned when a permanent removal is asked for on a device that has not
+// been revoked yet.
+//
+// Unlike ErrDeviceNotFound this one is safe to report precisely: the caller has already proved it
+// owns the account the device belongs to, so there is no id to leak, and "revoke it first" is the
+// only useful thing to say.
+var ErrDeviceStillActive = errors.New("device has not been revoked")
+
+// DeleteRevokedDevice permanently removes one revoked device row.
+//
+// Revocation is the security action and it is complete on its own: the row keeps failing
+// authentication for as long as it exists. This is the housekeeping that follows, for the operator
+// who has a dashboard full of tombstones for phones they no longer own. That is why it refuses to
+// touch a live device — a delete would revoke it as a side effect, silently, and the operator would
+// have asked for tidying and got a disconnection.
+//
+// Deleting the row is safe for the notes: every synced table references devices only through
+// `last_writer ... ON DELETE SET NULL`, so the attribution is dropped and nothing else. The
+// device's `applied_batches` rows cascade away with it, which costs nothing — a revoked device
+// never pushes again, so it has no retry left to replay.
+func DeleteRevokedDevice(ctx context.Context, pool *pgxpool.Pool, accountID string, deviceID string) error {
+	if !IsUUID(deviceID) {
+		return ErrDeviceNotFound
+	}
+
+	const statement = `
+		DELETE FROM devices
+		WHERE id = $1::uuid AND account_id = $2::uuid AND revoked_at IS NOT NULL`
+
+	result, err := pool.Exec(ctx, statement, deviceID, accountID)
+	if err != nil {
+		return fmt.Errorf("removing a revoked device: %w", err)
+	}
+	if result.RowsAffected() == 1 {
+		return nil
+	}
+
+	// Nothing was deleted, so the row is either absent or still live. Only the failure path pays
+	// for the second query, and it buys an error the operator can act on.
+	const existsStatement = `SELECT EXISTS (SELECT 1 FROM devices WHERE id = $1::uuid AND account_id = $2::uuid)`
+	var deviceExists bool
+	if err := pool.QueryRow(ctx, existsStatement, deviceID, accountID).Scan(&deviceExists); err != nil {
+		return fmt.Errorf("removing a revoked device: %w", err)
+	}
+	if deviceExists {
+		return ErrDeviceStillActive
+	}
+	return ErrDeviceNotFound
+}
+
+// DeleteRevokedDevices removes every revoked device on an account and reports how many rows went.
+//
+// A dashboard accumulates revoked rows one per replaced phone, and clearing them one button at a
+// time is the kind of chore that means they never get cleared. Removing none is not an error: the
+// caller asked for a state, and an already-tidy list is that state.
+func DeleteRevokedDevices(ctx context.Context, pool *pgxpool.Pool, accountID string) (int64, error) {
+	const statement = `DELETE FROM devices WHERE account_id = $1::uuid AND revoked_at IS NOT NULL`
+
+	result, err := pool.Exec(ctx, statement, accountID)
+	if err != nil {
+		return 0, fmt.Errorf("removing revoked devices: %w", err)
+	}
+	return result.RowsAffected(), nil
+}
