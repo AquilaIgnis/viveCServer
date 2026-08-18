@@ -83,10 +83,12 @@ func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 			return
 		}
 
-		// Diagnostic only, and never allowed to fail the request it describes: a stale column is a
-		// far better outcome than a delta the client already holds being re-fetched.
-		if err := store.RecordPulledSeq(r.Context(), pool, caller.DeviceID, result.Cursor); err != nil {
-			logger.Warn("could not record a device pull cursor",
+		// `since` is the cursor the client presented, so it is proof that an earlier response was
+		// received and committed locally. The cursor in this response is not proof yet: recording it
+		// before writing the body would let a dropped connection acknowledge a tombstone the client
+		// never saw. This acknowledgement is housekeeping and never allowed to fail the pull.
+		if err := store.RecordAcknowledgedSeq(r.Context(), pool, caller.DeviceID, sinceCursor); err != nil {
+			logger.Warn("could not record a device acknowledged cursor",
 				"account_id", caller.AccountID, "device_id", caller.DeviceID, "error", err)
 		}
 

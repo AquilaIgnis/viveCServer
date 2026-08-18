@@ -22,14 +22,17 @@ import (
 )
 
 type fakeAdminStore struct {
-	accountCount int64
-	account      store.Account
-	sessions     map[string]string
-	devices      []store.Device
-	notebooks    []store.NotebookSummary
-	revokedID    string
-	renamedID    string
-	removedIDs   []string
+	accountCount       int64
+	account            store.Account
+	sessions           map[string]string
+	devices            []store.Device
+	notebooks          []store.NotebookSummary
+	archivedNotebooks  []store.NotebookSummary
+	deleteNotebookErr  error
+	deletedNotebookIDs []string
+	revokedID          string
+	renamedID          string
+	removedIDs         []string
 }
 
 func (database *fakeAdminStore) CountAccounts(context.Context) (int64, error) {
@@ -155,14 +158,40 @@ func (database *fakeAdminStore) DeleteRevokedDevices(_ context.Context, accountI
 	return removedCount, nil
 }
 
-func (database *fakeAdminStore) NotebookOverview(_ context.Context, accountID string, limit int) (int64, []store.NotebookSummary, error) {
+func (database *fakeAdminStore) NotebookOverview(_ context.Context, accountID string, limit int) (store.NotebookOverviewResult, error) {
 	if accountID != database.account.ID {
-		return 0, nil, errors.New("wrong account")
+		return store.NotebookOverviewResult{}, errors.New("wrong account")
 	}
-	if len(database.notebooks) > limit {
-		return int64(len(database.notebooks)), database.notebooks[:limit], nil
+	overview := store.NotebookOverviewResult{
+		NotebookCount:         int64(len(database.notebooks)),
+		ArchivedNotebookCount: int64(len(database.archivedNotebooks)),
 	}
-	return int64(len(database.notebooks)), database.notebooks, nil
+	overview.Notebooks = database.notebooks[:min(len(database.notebooks), limit)]
+	overview.ArchivedNotebooks = database.archivedNotebooks[:min(len(database.archivedNotebooks), limit)]
+	return overview, nil
+}
+
+func (database *fakeAdminStore) DeleteArchivedNotebook(_ context.Context, accountID string, notebookID string) error {
+	if accountID != database.account.ID {
+		return store.ErrNotebookNotFound
+	}
+	if database.deleteNotebookErr != nil {
+		return database.deleteNotebookErr
+	}
+	for index, notebook := range database.archivedNotebooks {
+		if notebook.ID != notebookID {
+			continue
+		}
+		database.archivedNotebooks = append(database.archivedNotebooks[:index], database.archivedNotebooks[index+1:]...)
+		database.deletedNotebookIDs = append(database.deletedNotebookIDs, notebookID)
+		return nil
+	}
+	for _, notebook := range database.notebooks {
+		if notebook.ID == notebookID {
+			return store.ErrNotebookNotArchived
+		}
+	}
+	return store.ErrNotebookNotFound
 }
 
 func newAdminTestHandler(database adminStore) http.Handler {
@@ -541,6 +570,131 @@ func TestDashboardCountsAndNamesNotebooks(t *testing.T) {
 	}
 }
 
+// TestDashboardShowsClientDeletesInTheArchive: a client deletion remains a sync tombstone in the
+// database, and the dashboard gives that durable row a place of its own instead of making it look
+// as though the server discarded it.
+func TestDashboardShowsClientDeletesInTheArchive(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivedAt := time.Date(2026, 8, 18, 14, 45, 0, 0, time.UTC)
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		archivedNotebooks: []store.NotebookSummary{
+			{ID: "nb-old", Name: `<script>alert("archived")</script>`, ServerUpdatedAt: archivedAt, ReadyForPermanentDeletion: true},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin?tab=archived", nil)
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("archive status = %d, want 200", response.Code)
+	}
+	if !strings.Contains(body, `data-tab="archived" aria-current="page">Archived <span class="count-badge">1</span>`) {
+		t.Fatal("the archived tab did not show its count or selected state")
+	}
+	if !strings.Contains(body, `<div data-panel="archived">`) || !strings.Contains(body, `<div data-panel="notebooks" hidden>`) {
+		t.Fatal("the archived panel was not the only visible notebook panel")
+	}
+	if !strings.Contains(body, "Archived Aug 18, 2026") {
+		t.Fatal("the archived row did not show the server-confirmed archive date")
+	}
+	if strings.Contains(body, `<script>alert("archived")</script>`) || !strings.Contains(body, `&lt;script&gt;alert`) {
+		t.Fatal("an archived notebook name was not HTML-escaped")
+	}
+	if !strings.Contains(body, `action="/admin/notebooks/delete"`) || !strings.Contains(body, `name="notebook_id" value="nb-old"`) {
+		t.Fatal("the archived row has no permanent-delete form for its notebook id")
+	}
+	if !strings.Contains(body, `data-confirm-message="Permanently delete this archived notebook and all of its contents? This cannot be undone."`) {
+		t.Fatal("the permanent-delete form does not ask for destructive confirmation")
+	}
+	if strings.Contains(body, `class="button-danger" disabled`) {
+		t.Fatal("a notebook acknowledged by every active device still has a disabled delete button")
+	}
+}
+
+func TestPermanentNotebookDeletionRequiresCSRFAndReturnsToTheArchive(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount:      1,
+		account:           store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		archivedNotebooks: []store.NotebookSummary{{ID: "nb-old", Name: "Old field notes", ReadyForPermanentDeletion: true}},
+		sessions:          map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	post := func(csrf string) *httptest.ResponseRecorder {
+		t.Helper()
+		form := url.Values{"notebook_id": {"nb-old"}, "csrf_token": {csrf}}
+		request := httptest.NewRequest(http.MethodPost, "/admin/notebooks/delete", strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	if response := post("wrong"); response.Code != http.StatusForbidden {
+		t.Fatalf("delete without valid CSRF = %d, want 403", response.Code)
+	}
+	if len(database.archivedNotebooks) != 1 {
+		t.Fatal("invalid CSRF permanently deleted the notebook")
+	}
+
+	response := post(adminCSRFToken(plainToken))
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/admin?tab=archived#contents" {
+		t.Fatalf("successful delete = %d %q, want 303 back to Archived", response.Code, response.Header().Get("Location"))
+	}
+	if len(database.archivedNotebooks) != 0 || fmt.Sprint(database.deletedNotebookIDs) != "[nb-old]" {
+		t.Fatalf("deleted ids = %v with %d archive rows left, want only nb-old removed", database.deletedNotebookIDs, len(database.archivedNotebooks))
+	}
+}
+
+func TestPermanentNotebookDeletionExplainsADeviceThatHasNotSynced(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount:      1,
+		account:           store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		archivedNotebooks: []store.NotebookSummary{{ID: "nb-old", Name: "Old field notes"}},
+		deleteNotebookErr: store.ErrNotebookDeletionNotSynced,
+		sessions:          map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	archivePage := httptest.NewRecorder()
+	archiveRequest := httptest.NewRequest(http.MethodGet, "/admin?tab=archived", nil)
+	archiveRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(archivePage, archiveRequest)
+	if !strings.Contains(archivePage.Body.String(), `class="button-danger" disabled`) || !strings.Contains(archivePage.Body.String(), "Waiting for active devices to sync.") {
+		t.Fatal("the archive did not disable permanent deletion while a device was behind")
+	}
+
+	form := url.Values{"notebook_id": {"nb-old"}, "csrf_token": {adminCSRFToken(plainToken)}}
+	request := httptest.NewRequest(http.MethodPost, "/admin/notebooks/delete", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "Wait for every active device to sync") {
+		t.Fatalf("pending delete = %d %q, want an actionable 409", response.Code, response.Body.String())
+	}
+}
+
 // TestDashboardSaysHowManyNotebookNamesItLeftOut: the list is a disclosure in a statistics tile,
 // not an inventory screen, so it stops -- and says that it stopped rather than showing a prefix of
 // the truth as if it were all of it.
@@ -583,11 +737,12 @@ func TestTabsWorkWithoutTheBrowserScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	database := &fakeAdminStore{
-		accountCount: 1,
-		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
-		devices:      []store.Device{{ID: "20000000-0000-0000-0000-000000000002", Name: "Studio tablet"}},
-		notebooks:    []store.NotebookSummary{{ID: "nb-1", Name: "Field notes"}},
-		sessions:     map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+		accountCount:      1,
+		account:           store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		devices:           []store.Device{{ID: "20000000-0000-0000-0000-000000000002", Name: "Studio tablet"}},
+		notebooks:         []store.NotebookSummary{{ID: "nb-1", Name: "Field notes"}},
+		archivedNotebooks: []store.NotebookSummary{{ID: "nb-old", Name: "Old field notes"}},
+		sessions:          map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
 	}
 	handler := newAdminTestHandler(database)
 
@@ -616,6 +771,11 @@ func TestTabsWorkWithoutTheBrowserScript(t *testing.T) {
 	// while the notebooks are.
 	if !strings.Contains(notebooksTab, `<div class="panel-actions" data-panel="devices" hidden>`) {
 		t.Fatal("the device actions stayed visible on the notebooks tab")
+	}
+
+	archivedTab := fetch("/admin?tab=archived")
+	if !strings.Contains(archivedTab, `<div data-panel="archived">`) || !strings.Contains(archivedTab, `<div data-panel="notebooks" hidden>`) || !strings.Contains(archivedTab, `<div data-panel="devices" hidden>`) {
+		t.Fatal("?tab=archived did not switch the visible panel")
 	}
 
 	// A value nobody meant lands on the devices tab rather than on an error page.

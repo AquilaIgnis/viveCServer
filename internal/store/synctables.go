@@ -612,14 +612,18 @@ func RecordAppliedBatchResponse(
 	return nil
 }
 
-// RecordPulledSeq stores how far a device has pulled, for the dashboard and for finding devices
-// whose cursor has fallen behind the tombstone horizon (SD8). It never moves backwards, so an
-// out-of-order response from a retrying client cannot make a device look staler than it is.
-func RecordPulledSeq(ctx context.Context, database Querier, deviceID string, cursor int64) error {
+// RecordAcknowledgedSeq stores the highest cursor a device has presented as `since` on a later
+// pull. That is stronger than recording the cursor the server is about to return: a response can be
+// lost after the database update but before the client receives its body. A cursor presented by the
+// client proves it received and committed every change through that sequence, which is what makes
+// permanent tombstone deletion safe.
+//
+// It never moves backwards, so an out-of-order request cannot make a device look staler than it is.
+func RecordAcknowledgedSeq(ctx context.Context, database Querier, deviceID string, cursor int64) error {
 	const statement = `UPDATE devices SET last_pulled_seq = $2 WHERE id = $1::uuid AND last_pulled_seq < $2`
 
 	if _, err := database.Exec(ctx, statement, deviceID, cursor); err != nil {
-		return fmt.Errorf("recording a pull cursor: %w", err)
+		return fmt.Errorf("recording an acknowledged pull cursor: %w", err)
 	}
 	return nil
 }

@@ -607,7 +607,7 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Diagnostic cursor last reported by the device.
+          description: Highest pull cursor later presented by the device as its `since` value, confirming that all changes through it were committed locally.
         revokedAt:
           type: string
           format: date-time

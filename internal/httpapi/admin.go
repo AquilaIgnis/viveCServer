@@ -47,7 +47,8 @@ type adminStore interface {
 	RevokeDevice(ctx context.Context, accountID string, deviceID string) error
 	DeleteRevokedDevice(ctx context.Context, accountID string, deviceID string) error
 	DeleteRevokedDevices(ctx context.Context, accountID string) (int64, error)
-	NotebookOverview(ctx context.Context, accountID string, limit int) (int64, []store.NotebookSummary, error)
+	NotebookOverview(ctx context.Context, accountID string, limit int) (store.NotebookOverviewResult, error)
+	DeleteArchivedNotebook(ctx context.Context, accountID string, notebookID string) error
 }
 
 type postgresAdminStore struct {
@@ -102,8 +103,12 @@ func (database postgresAdminStore) DeleteRevokedDevices(ctx context.Context, acc
 	return store.DeleteRevokedDevices(ctx, database.pool, accountID)
 }
 
-func (database postgresAdminStore) NotebookOverview(ctx context.Context, accountID string, limit int) (int64, []store.NotebookSummary, error) {
+func (database postgresAdminStore) NotebookOverview(ctx context.Context, accountID string, limit int) (store.NotebookOverviewResult, error) {
 	return store.NotebookOverview(ctx, database.pool, accountID, limit)
+}
+
+func (database postgresAdminStore) DeleteArchivedNotebook(ctx context.Context, accountID string, notebookID string) error {
+	return store.DeleteArchivedNotebook(ctx, database.pool, accountID, notebookID)
 }
 
 type adminApplication struct {
@@ -133,6 +138,7 @@ func (application adminApplication) handler(pool *pgxpool.Pool) http.Handler {
 	// pattern in Go's mux -- but it reads in the order the operator meets the two buttons.
 	mux.HandleFunc("POST /admin/devices/remove-revoked", application.handleRemoveRevokedDevices)
 	mux.HandleFunc("POST /admin/devices/{deviceID}/remove", application.handleRemoveDevice)
+	mux.HandleFunc("POST /admin/notebooks/delete", application.handleDeleteArchivedNotebook)
 
 	return withAdminSecurityHeaders(withPanicRecovery(withRequestLogging(mux, application.logger), application.logger))
 }
@@ -362,17 +368,33 @@ func (application adminApplication) handleDashboard(w http.ResponseWriter, r *ht
 		})
 	}
 
-	notebookCount, notebooks, err := application.store.NotebookOverview(r.Context(), account.ID, maxDashboardNotebooks)
+	notebookOverview, err := application.store.NotebookOverview(r.Context(), account.ID, maxDashboardNotebooks)
 	if err != nil {
 		application.writeAdminError(w, "Could not load synced notebooks.", "listing notebooks for admin failed", err)
 		return
 	}
-	notebookViews := make([]adminNotebookView, 0, len(notebooks))
-	for _, notebook := range notebooks {
+	notebookViews := make([]adminNotebookView, 0, len(notebookOverview.Notebooks))
+	for _, notebook := range notebookOverview.Notebooks {
 		notebookViews = append(notebookViews, adminNotebookView{
+			ID:        notebook.ID,
 			Name:      notebook.Name,
 			UpdatedAt: formatAdminTime(notebook.ServerUpdatedAt),
 		})
+	}
+	archivedNotebookViews := make([]adminNotebookView, 0, len(notebookOverview.ArchivedNotebooks))
+	for _, notebook := range notebookOverview.ArchivedNotebooks {
+		archivedNotebookViews = append(archivedNotebookViews, adminNotebookView{
+			ID:                   notebook.ID,
+			Name:                 notebook.Name,
+			UpdatedAt:            formatAdminTime(notebook.ServerUpdatedAt),
+			CanPermanentlyDelete: notebook.ReadyForPermanentDeletion,
+		})
+	}
+
+	selectedTab := "devices"
+	switch r.URL.Query().Get("tab") {
+	case "notebooks", "archived":
+		selectedTab = r.URL.Query().Get("tab")
 	}
 
 	application.writeAdminPage(w, http.StatusOK, adminDashboardTemplate, dashboardPageData{
@@ -383,15 +405,17 @@ func (application adminApplication) handleDashboard(w http.ResponseWriter, r *ht
 		DeviceCount:        len(devices),
 		RevokedDeviceCount: len(devices) - activeDeviceCount,
 		Devices:            views,
-		NotebookCount:      notebookCount,
+		NotebookCount:      notebookOverview.NotebookCount,
 		Notebooks:          notebookViews,
 		// Only ever positive when an account has more notebooks than the page will render, which
 		// the list says out loud rather than quietly showing a prefix of the truth.
-		HiddenNotebookCount: notebookCount - int64(len(notebookViews)),
-		// Anything that is not the notebooks tab is the devices tab, so a mangled or missing value
-		// lands on the panel the operator came for rather than on an error.
-		NotebooksSelected: r.URL.Query().Get("tab") == "notebooks",
-		CSRFToken:         adminCSRFToken(plainSessionToken),
+		HiddenNotebookCount:   notebookOverview.NotebookCount - int64(len(notebookViews)),
+		ArchivedNotebookCount: notebookOverview.ArchivedNotebookCount,
+		ArchivedNotebooks:     archivedNotebookViews,
+		HiddenArchivedCount:   notebookOverview.ArchivedNotebookCount - int64(len(archivedNotebookViews)),
+		// Anything that is not a recognised content tab lands on devices rather than an error.
+		SelectedTab: selectedTab,
+		CSRFToken:   adminCSRFToken(plainSessionToken),
 	})
 }
 
@@ -538,6 +562,56 @@ func (application adminApplication) handleRemoveRevokedDevices(w http.ResponseWr
 	redirectToDeviceList(w, r)
 }
 
+// handleDeleteArchivedNotebook permanently removes one acknowledged notebook tombstone.
+//
+// The store refuses a live row and a tombstone that any active device has not pulled yet. That
+// second check is what keeps this housekeeping action from erasing the only copy of a delete before
+// an offline client can observe it.
+func (application adminApplication) handleDeleteArchivedNotebook(w http.ResponseWriter, r *http.Request) {
+	account, plainSessionToken, ok := application.requireAdminSession(w, r)
+	if !ok {
+		return
+	}
+	if !parseAdminForm(w, r) || !constantTimeTokenMatch(adminCSRFToken(plainSessionToken), r.PostFormValue("csrf_token")) {
+		application.writeAdminPage(w, http.StatusForbidden, adminErrorTemplate, adminErrorPageData{
+			Title:   "Request expired",
+			Message: "Return to the dashboard and try again.",
+		})
+		return
+	}
+
+	notebookID := r.PostFormValue("notebook_id")
+	err := application.store.DeleteArchivedNotebook(r.Context(), account.ID, notebookID)
+	if errors.Is(err, store.ErrNotebookDeletionNotSynced) {
+		application.writeAdminPage(w, http.StatusConflict, adminErrorTemplate, adminErrorPageData{
+			Title:   "Deletion is still syncing",
+			Message: "Wait for every active device to sync before permanently deleting this notebook. Revoke a device first if it is no longer in use.",
+		})
+		return
+	}
+	if errors.Is(err, store.ErrNotebookNotArchived) {
+		application.writeAdminPage(w, http.StatusConflict, adminErrorTemplate, adminErrorPageData{
+			Title:   "Notebook is not archived",
+			Message: "Only a notebook deleted by a client can be permanently removed here.",
+		})
+		return
+	}
+	if errors.Is(err, store.ErrNotebookNotFound) {
+		application.writeAdminPage(w, http.StatusNotFound, adminErrorTemplate, adminErrorPageData{
+			Title:   "Notebook not found",
+			Message: "That archived notebook does not exist for this account. It may already have been permanently deleted.",
+		})
+		return
+	}
+	if err != nil {
+		application.writeAdminError(w, "Could not permanently delete the notebook.", "permanently deleting an archived notebook from admin failed", err)
+		return
+	}
+
+	application.logger.Info("archived notebook permanently deleted from admin panel", "account_id", account.ID, "notebook_id", notebookID)
+	redirectToArchiveList(w, r)
+}
+
 func (application adminApplication) handleLogout(w http.ResponseWriter, r *http.Request) {
 	_, plainSessionToken, err := application.accountFromSession(r)
 	if errors.Is(err, store.ErrAdminSessionNotFound) {
@@ -671,6 +745,10 @@ func redirectToDevice(w http.ResponseWriter, r *http.Request, deviceID string) {
 // redirectToDeviceList lands on the panel rather than a row, for actions that removed the row.
 func redirectToDeviceList(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin?tab=devices#contents", http.StatusSeeOther)
+}
+
+func redirectToArchiveList(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/admin?tab=archived#contents", http.StatusSeeOther)
 }
 
 func parseAdminForm(w http.ResponseWriter, r *http.Request) bool {

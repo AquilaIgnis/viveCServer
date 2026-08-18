@@ -36,27 +36,32 @@ type adminDeviceView struct {
 	Active     bool
 }
 
-// adminNotebookView is one notebook name on the dashboard. Ids are deliberately absent: they are
-// client-generated opaque strings that mean nothing to the person reading the list, and the
-// timestamp is what actually tells two notebooks with the same name apart.
+// adminNotebookView is one notebook on the dashboard. The client-generated opaque id is never
+// displayed, but an archived row submits it back when the operator permanently deletes that exact
+// notebook. The timestamp is what tells two notebooks with the same name apart on screen.
 type adminNotebookView struct {
-	Name      string
-	UpdatedAt string
+	ID                   string
+	Name                 string
+	UpdatedAt            string
+	CanPermanentlyDelete bool
 }
 
 type dashboardPageData struct {
-	Email               string
-	CreatedAt           string
-	Storage             string
-	ActiveDeviceCount   int
-	DeviceCount         int
-	RevokedDeviceCount  int
-	Devices             []adminDeviceView
-	NotebookCount       int64
-	Notebooks           []adminNotebookView
-	HiddenNotebookCount int64
-	NotebooksSelected   bool
-	CSRFToken           string
+	Email                 string
+	CreatedAt             string
+	Storage               string
+	ActiveDeviceCount     int
+	DeviceCount           int
+	RevokedDeviceCount    int
+	Devices               []adminDeviceView
+	NotebookCount         int64
+	Notebooks             []adminNotebookView
+	HiddenNotebookCount   int64
+	ArchivedNotebookCount int64
+	ArchivedNotebooks     []adminNotebookView
+	HiddenArchivedCount   int64
+	SelectedTab           string
+	CSRFToken             string
 }
 
 type adminErrorPageData struct {
@@ -214,10 +219,11 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
         <!-- Real links, not scripted buttons. Without the script they still work: the server reads
              ?tab= and renders the same page with the other panel showing. -->
         <nav class="tab-strip" data-tab-strip aria-label="Server contents">
-          <a class="tab{{if not .NotebooksSelected}} is-selected{{end}}" href="/admin?tab=devices" data-tab="devices"{{if not .NotebooksSelected}} aria-current="page"{{end}}>Devices <span class="count-badge">{{.DeviceCount}}</span></a>
-          <a class="tab{{if .NotebooksSelected}} is-selected{{end}}" href="/admin?tab=notebooks" data-tab="notebooks"{{if .NotebooksSelected}} aria-current="page"{{end}}>Notebooks <span class="count-badge">{{.NotebookCount}}</span></a>
+          <a class="tab{{if eq .SelectedTab "devices"}} is-selected{{end}}" href="/admin?tab=devices" data-tab="devices"{{if eq .SelectedTab "devices"}} aria-current="page"{{end}}>Devices <span class="count-badge">{{.DeviceCount}}</span></a>
+          <a class="tab{{if eq .SelectedTab "notebooks"}} is-selected{{end}}" href="/admin?tab=notebooks" data-tab="notebooks"{{if eq .SelectedTab "notebooks"}} aria-current="page"{{end}}>Notebooks <span class="count-badge">{{.NotebookCount}}</span></a>
+          <a class="tab{{if eq .SelectedTab "archived"}} is-selected{{end}}" href="/admin?tab=archived" data-tab="archived"{{if eq .SelectedTab "archived"}} aria-current="page"{{end}}>Archived <span class="count-badge">{{.ArchivedNotebookCount}}</span></a>
         </nav>
-        <div class="panel-actions" data-panel="devices"{{if .NotebooksSelected}} hidden{{end}}>
+        <div class="panel-actions" data-panel="devices"{{if ne .SelectedTab "devices"}} hidden{{end}}>
           {{if .RevokedDeviceCount}}
           <form method="post" action="/admin/devices/remove-revoked">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
@@ -226,7 +232,7 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
           {{end}}
         </div>
       </div>
-      <div data-panel="devices"{{if .NotebooksSelected}} hidden{{end}}>
+      <div data-panel="devices"{{if ne .SelectedTab "devices"}} hidden{{end}}>
       {{if .Devices}}
       <div class="record-list">
         {{range .Devices}}
@@ -261,7 +267,7 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
       <div class="empty-state"><span aria-hidden="true">◇</span><h3>No devices yet</h3><p>Connect viveNotes to the sync port to register the first device.</p></div>
       {{end}}
       </div>
-      <div data-panel="notebooks"{{if not .NotebooksSelected}} hidden{{end}}>
+      <div data-panel="notebooks"{{if ne .SelectedTab "notebooks"}} hidden{{end}}>
       {{if .Notebooks}}
       <div class="record-list">
         {{range .Notebooks}}
@@ -277,6 +283,30 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
       {{if .HiddenNotebookCount}}<p class="list-note">{{.HiddenNotebookCount}} more not shown.</p>{{end}}
       {{else}}
       <div class="empty-state"><span aria-hidden="true">◇</span><h3>No notebooks yet</h3><p>Notebooks appear here once a device syncs them to this server.</p></div>
+      {{end}}
+      </div>
+      <div data-panel="archived"{{if ne .SelectedTab "archived"}} hidden{{end}}>
+      {{if .ArchivedNotebooks}}
+      <div class="record-list">
+        {{range .ArchivedNotebooks}}
+        <article class="record-row">
+          <div class="record-icon archived" aria-hidden="true">▣</div>
+          <div class="record-main">
+            <div class="record-title"><strong>{{.Name}}</strong><span class="record-state">Archived</span></div>
+            <p>Archived {{.UpdatedAt}}</p>
+          </div>
+          <form method="post" action="/admin/notebooks/delete" class="archive-delete" data-confirm-message="Permanently delete this archived notebook and all of its contents? This cannot be undone.">
+            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+            <input type="hidden" name="notebook_id" value="{{.ID}}">
+            <button type="submit" class="button-danger"{{if not .CanPermanentlyDelete}} disabled title="Every active device must sync the deletion first."{{end}}>Permanently delete</button>
+            {{if not .CanPermanentlyDelete}}<small>Waiting for active devices to sync.</small>{{end}}
+          </form>
+        </article>
+        {{end}}
+      </div>
+      {{if .HiddenArchivedCount}}<p class="list-note">{{.HiddenArchivedCount}} more not shown.</p>{{end}}
+      {{else}}
+      <div class="empty-state"><span aria-hidden="true">◇</span><h3>No archived notebooks</h3><p>Notebooks deleted by a synced client will be retained here.</p></div>
       {{end}}
       </div>
     </section>
@@ -348,6 +378,7 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px #72e6a522; }
 .field-hint { color: var(--muted); font-size: .76rem; font-weight: 450; }
 button, .button-link { display: inline-flex; align-items: center; justify-content: center; min-height: 2.7rem; padding: .7rem 1rem; border: 0; border-radius: .7rem; color: var(--accent-dark); background: var(--accent); font-weight: 800; text-decoration: none; cursor: pointer; }
 button:hover, .button-link:hover { filter: brightness(1.08); }
+button:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 .button-secondary { min-height: 2.35rem; border: 1px solid var(--border); color: var(--text); background: var(--surface-raised); }
 .button-danger { min-height: 2.35rem; border: 1px solid #653338; color: var(--danger); background: transparent; }
 .security-note { margin: 1.5rem 0 0; color: var(--muted); font-size: .78rem; text-align: center; }
@@ -397,6 +428,8 @@ button:hover, .button-link:hover { filter: brightness(1.08); }
 .record-main p, .record-main small { margin: .25rem 0 0; color: var(--muted); font-size: .8rem; }
 .record-state { padding: .15rem .45rem; border-radius: 999px; color: var(--muted); background: #ffffff0a; font-size: .65rem; font-weight: 800; text-transform: uppercase; }
 .record-state.active { color: var(--accent); background: #72e6a510; }
+.archive-delete { display: grid; justify-items: end; gap: .35rem; }
+.archive-delete small { color: var(--muted); font-size: .68rem; }
 /* The rename field sizes to its own content rather than taking the shared full-width input rule, so
    a device row stays a row: the point of renaming is to tell two rows apart at a glance. */
 .device-rename { display: flex; align-items: center; gap: .5rem; }
@@ -487,6 +520,14 @@ const adminScript = `
         history.replaceState(null, "", tab.href);
       });
     }
+  }
+
+  for (const form of document.querySelectorAll("form[data-confirm-message]")) {
+    form.addEventListener("submit", (event) => {
+      if (!window.confirm(form.dataset.confirmMessage)) {
+        event.preventDefault();
+      }
+    });
   }
 
   const output = document.getElementById("live-log-output");
