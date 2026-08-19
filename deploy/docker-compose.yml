@@ -17,7 +17,7 @@ services:
       POSTGRES_DB: vive
       POSTGRES_PASSWORD: ${VIVE_POSTGRES_PASSWORD:-vive-local-only}
     volumes:
-      - ./data/postgres:/var/lib/postgresql
+      - ./data/postgres:/var/lib/postgresql:Z
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U vive -d vive']
       interval: 2s
@@ -31,11 +31,18 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     pull_policy: build
+
+    user: '1000:1000'
+
     environment:
       VIVE_DATABASE_URL: postgres://vive:${VIVE_POSTGRES_PASSWORD:-vive-local-only}@postgres:5432/vive?sslmode=disable
       VIVE_ADMIN_LISTEN_ADDR: ':8080'
       VIVE_SYNC_LISTEN_ADDR: ':8281'
       VIVE_LOG_LEVEL: ${VIVE_LOG_LEVEL:-info}
+    volumes:
+      # have to run this sudo because docker if fucking retarded
+      # sudo chown -R 1000:1000 deploy/data/blobs
+      - ./data/blobs:/var/lib/vivecserver/blobs:Z
     ports:
       - '${VIVE_ADMIN_PORT:-8080}:8080'
       - '${VIVE_SYNC_PORT:-5444}:8281'
@@ -44,8 +51,5 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
     stop_grace_period: 20s
     restart: unless-stopped

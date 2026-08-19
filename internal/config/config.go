@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,8 +25,9 @@ const (
 	// else will use. Accounts are created with the `create-account` subcommand instead.
 	SignupModeClosed SignupMode = "closed"
 
-	// SignupModeOpen lets anyone register. Appropriate for a private network, or a deliberate
-	// decision paired with the rate limiting of S6.
+	// SignupModeOpen lets anyone register. Appropriate for a private network, and a deliberate
+	// decision on a server reachable from anywhere else: there is no rate limiting to pair it with,
+	// because a personal server has none (syncPlan.md §12 decision 1).
 	SignupModeOpen SignupMode = "open"
 )
 
@@ -47,6 +49,21 @@ type Config struct {
 	// at the outside; a day of margin costs one small row per push and makes the window a
 	// non-question for anyone self-hosting.
 	BatchReplayWindow time.Duration
+
+	// Where attachment bytes are stored (syncPlan.md §8, S5).
+	BlobDirectory string
+
+	// MaxBlobBytes caps one attachment. There is deliberately no per-account quota — see
+	// syncPlan.md §12 decision 1.
+	MaxBlobBytes int64
+
+	// BlobSweepInterval is how often unreferenced attachments are collected. Zero disables the
+	// sweep, which leaks disk but never loses a byte — the right trade for an operator debugging
+	// whether something has gone missing.
+	BlobSweepInterval time.Duration
+
+	// BlobRetention is how long an attachment nothing references is kept before it is deleted.
+	BlobRetention time.Duration
 }
 
 const (
@@ -62,7 +79,31 @@ const (
 	// an operator eventually writes `24h` into it and gets a parse error, or writes `48` into one of
 	// the others and gets 48 nanoseconds.
 	batchReplayWindowSetting = "VIVE_BATCH_REPLAY_WINDOW"
+
+	blobDirectorySetting     = "VIVE_BLOB_DIR"
+	maxBlobBytesSetting      = "VIVE_MAX_BLOB_BYTES"
+	blobSweepIntervalSetting = "VIVE_BLOB_SWEEP_INTERVAL"
+	blobRetentionSetting     = "VIVE_BLOB_RETENTION"
 )
+
+// defaultBlobDirectory is inside the container's data volume rather than beside the binary, because
+// the delivered image runs read-only (deploy/docker-compose.yml) and this is the one path that has
+// to be writable.
+const defaultBlobDirectory = "/var/lib/vivecserver/blobs"
+
+// defaultMaxBlobBytes mirrors NotebookTransferManager's own 32 MB per-attachment ceiling, so a
+// notebook that imports from a `.vive` bundle also syncs and neither path can produce a corpus the
+// other refuses (syncPlan.md §6).
+const defaultMaxBlobBytes int64 = 32 << 20
+
+// defaultBlobRetention is how long bytes nothing points at survive.
+//
+// It is not a tidiness setting, it is the width of two races: a client that uploads a picture and
+// then loses connectivity before pushing the change that references it, and a device that is still
+// downloading a picture from a page another device has just deleted. A day covers a phone that went
+// into a tunnel; the cost of being generous is disk, and the cost of being mean is a picture that
+// has to be uploaded twice.
+const defaultBlobRetention = 24 * time.Hour
 
 // Load reads configuration from the environment, having first merged any `.env` file beside the
 // binary.
@@ -95,6 +136,21 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	maxBlobBytes, err := readByteCountSetting(maxBlobBytesSetting, defaultMaxBlobBytes)
+	if err != nil {
+		return Config{}, err
+	}
+
+	blobSweepInterval, err := readOptionalDurationSetting(blobSweepIntervalSetting, time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+
+	blobRetention, err := readDurationSetting(blobRetentionSetting, defaultBlobRetention)
+	if err != nil {
+		return Config{}, err
+	}
+
 	settings := Config{
 		AdminListenAddress: readStringSetting(adminListenAddressSetting, ":8080"),
 		SyncListenAddress:  readStringSetting(syncListenAddressSetting, ":8281"),
@@ -103,6 +159,10 @@ func Load() (Config, error) {
 		SignupMode:         signupMode,
 		ShutdownTimeout:    shutdownTimeout,
 		BatchReplayWindow:  batchReplayWindow,
+		BlobDirectory:      readStringSetting(blobDirectorySetting, defaultBlobDirectory),
+		MaxBlobBytes:       maxBlobBytes,
+		BlobSweepInterval:  blobSweepInterval,
+		BlobRetention:      blobRetention,
 	}
 
 	if settings.AdminListenAddress == settings.SyncListenAddress {
@@ -124,6 +184,46 @@ func readStringSetting(settingName string, fallbackValue string) string {
 		return fallbackValue
 	}
 	return value
+}
+
+// readByteCountSetting reads a plain count of bytes.
+//
+// Deliberately not a size grammar: `32MB` is refused rather than guessed at, because it is
+// ambiguous by a factor of 4.9% that nobody notices until a limit is off, and because every other
+// numeric setting here is already a bare value or a Go duration. A loud parse error costs one
+// lookup; a silently misread limit costs a support thread.
+func readByteCountSetting(settingName string, fallbackValue int64) (int64, error) {
+	raw := readStringSetting(settingName, "")
+	if raw == "" {
+		return fallbackValue, nil
+	}
+
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a whole number of bytes, such as 33554432: %w", settingName, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("%s must not be negative, got %s", settingName, raw)
+	}
+	return parsed, nil
+}
+
+// readOptionalDurationSetting is readDurationSetting for a knob where zero means "off" rather than
+// "unset", so a self-hoster can stop the sweeper without editing anything else.
+func readOptionalDurationSetting(settingName string, fallbackValue time.Duration) (time.Duration, error) {
+	raw := readStringSetting(settingName, "")
+	if raw == "" {
+		return fallbackValue, nil
+	}
+
+	parsed, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a duration such as 1h: %w", settingName, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("%s must not be negative, got %s", settingName, raw)
+	}
+	return parsed, nil
 }
 
 func readDurationSetting(settingName string, fallbackValue time.Duration) (time.Duration, error) {

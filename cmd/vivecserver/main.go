@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AquilaIgnis/viveCServer/internal/blob"
+	"github.com/AquilaIgnis/viveCServer/internal/blobsweep"
 	"github.com/AquilaIgnis/viveCServer/internal/config"
 	"github.com/AquilaIgnis/viveCServer/internal/httpapi"
 	"github.com/AquilaIgnis/viveCServer/internal/livelog"
@@ -72,10 +74,34 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// Opened before the listeners, so a blob directory that is missing or read-only is a line at
+	// boot rather than the first failed picture upload a week later.
+	blobs, err := blob.OpenFileStore(settings.BlobDirectory)
+	if err != nil {
+		return err
+	}
+	logger.Info("attachment store ready",
+		"directory", blobs.Root(),
+		"max_attachment_bytes", settings.MaxBlobBytes,
+	)
+
+	// Its own context, cancelled with the process, so a sweep in progress stops at its next check
+	// instead of holding shutdown open for the length of a pass.
+	sweeper := blobsweep.NewSweeper(pool, blobs, logger, settings.BlobSweepInterval, settings.BlobRetention)
+	var sweeperFinished sync.WaitGroup
+	sweeperFinished.Add(1)
+	go func() {
+		defer sweeperFinished.Done()
+		sweeper.Run(ctx)
+	}()
+	defer sweeperFinished.Wait()
+
 	adminServer := newHTTPServer(settings.AdminListenAddress, httpapi.NewAdminHandler(pool, logger, liveLogBroker))
 	syncServer := newHTTPServer(settings.SyncListenAddress, httpapi.NewSyncHandler(pool, logger, httpapi.Options{
 		SignupMode:        settings.SignupMode,
 		BatchReplayWindow: settings.BatchReplayWindow,
+		Blobs:             blobs,
+		BlobLimits:        httpapi.BlobLimits{MaxBlobBytes: settings.MaxBlobBytes},
 	}))
 	servers := []namedHTTPServer{
 		{name: "admin", server: adminServer},
@@ -148,9 +174,14 @@ func newHTTPServer(listenAddress string, handler http.Handler) *http.Server {
 		// A server with no timeouts leaks a goroutine and a file descriptor per client that opens a
 		// connection and then says nothing, which is the cheapest denial of service there is.
 		//
-		// ReadTimeout and WriteTimeout cover the whole body, so they are the two that will need
-		// raising when S4 starts pushing large ink batches over a slow connection. Revisit them
-		// there against a measured worst case rather than guessing now.
+		// ReadTimeout and WriteTimeout cover the whole body, so they are the two a large request
+		// strains. S4's ink batches did not need them raised — a push is capped at 4 MB — but S5's
+		// attachments do: 32 MB over a slow mobile connection is minutes of legitimate transfer, and
+		// 60 seconds would cut off a client that was making steady progress, every time, for ever.
+		//
+		// The answer was to extend the deadline on those two routes per request rather than raise it
+		// for everybody (httpapi.blobTransferDeadline), so every other route keeps the cheap defence
+		// against a connection that opens and then says nothing.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,

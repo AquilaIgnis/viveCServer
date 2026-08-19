@@ -30,6 +30,18 @@ const maxCompressedRequestBytes = 4 * 1024 * 1024
 // point is arriving immediately.
 func withCompression(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Attachment bytes go past untouched, for three separate reasons that happen to agree.
+		// They are already compressed — the app re-encodes every import to JPEG — so gzip would
+		// spend CPU on both ends to add a little. They are served with Range support, and a
+		// compressor between ServeContent and the socket makes `Content-Range` describe a body the
+		// client did not receive. And the buffering writer below does not implement io.ReaderFrom,
+		// so it would quietly cost the `sendfile(2)` path that keeps a 32 MB download out of this
+		// process's memory entirely.
+		if strings.HasPrefix(r.URL.Path, blobPathPrefix) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
 			// MaxBytesReader first, so the bound applies to what arrives rather than to what it
 			// becomes. The handler's own limit then bounds the decoded stream.

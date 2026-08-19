@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+
+	"github.com/AquilaIgnis/viveCServer/internal/blob"
 )
 
 // maxDocBytes caps one document body.
@@ -17,8 +19,17 @@ import (
 // text, structure and equations.
 //
 // A document past this is rejected `too_large` rather than truncated. Raising it means raising the
-// batch cap with it, which is R1's binary-framing question and belongs to S4.
+// batch cap with it, which is R1's binary-framing question. S4 answered it for now: gzip on the wire
+// recovers most of what base64 costs a document, and a binary framing for ink batches stays in
+// reserve rather than becoming a second encoding for the whole protocol (syncPlan.md §13.8).
 const maxDocBytes = 2 << 20
+
+// maxBlobRefsPerPage caps how many attachments one document may name.
+//
+// Generous against any real page — the app re-encodes every import and a page is a screen, not an
+// album — and low enough that the reference set of one document stays a small write. Its purpose
+// is the same as maxExtraBytes': a field the client fills in must not be an unmetered write API.
+const maxBlobRefsPerPage = 512
 
 // maxCodecIDChars mirrors NotebookTransferManager.MAX_FORMAT_CHARS.
 const maxCodecIDChars = 128
@@ -59,6 +70,20 @@ type PageContentFields struct {
 	// Enc is how Doc is wrapped: `none/1` unless something wraps it. Empty means the same thing,
 	// because a client that has never heard of encodings still writes plain bodies.
 	Enc string `json:"enc"`
+
+	// BlobRefs are the attachment digests this document references — SD7, and the only way the
+	// server can ever know.
+	//
+	// The document is opaque here (§2), so reachability cannot be discovered from it: the client
+	// extracts the ids while pushing, and the server refuses the push if it does not already hold
+	// every one of them. That refusal is what enforces `plan.md` Phase 8's ordering requirement —
+	// attachments upload before the change referencing them — rather than trusting a client to
+	// keep to it. The server can never hold a dangling reference because it will not accept one.
+	//
+	// Absent and empty mean the same thing, which matters for forward compatibility: a client built
+	// before this field existed pushes documents with no `blobRefs` key, and a document with no
+	// pictures in it references nothing either way.
+	BlobRefs []string `json:"blobRefs"`
 }
 
 const pageContentChangeJSON = `extra || jsonb_build_object(
@@ -72,7 +97,13 @@ const pageContentChangeJSON = `extra || jsonb_build_object(
 		'doc', translate(encode(doc, 'base64'), E'\n', ''),
 		'docSha256', translate(encode(doc_sha256, 'base64'), E'\n', ''),
 		'format', format,
-		'enc', enc)`
+		'enc', enc,
+		'blobRefs', COALESCE((
+			SELECT jsonb_agg(encode(reference.sha256, 'hex') ORDER BY reference.sha256)
+			FROM page_blob_refs AS reference
+			WHERE reference.account_id = page_content.account_id
+			  AND reference.page_id = page_content.page_id
+		), '[]'::jsonb))`
 
 func (fields *PageContentFields) ParentID() string {
 	return fields.PageID
@@ -102,7 +133,63 @@ func (fields *PageContentFields) Validate() error {
 			return ErrDigestMismatch
 		}
 	}
+	if len(fields.BlobRefs) > maxBlobRefsPerPage {
+		return fmt.Errorf("%w: a page references more than %d attachments", ErrTooLarge, maxBlobRefsPerPage)
+	}
+	for _, digest := range fields.BlobRefs {
+		if err := blob.ValidateDigest(digest); err != nil {
+			return fmt.Errorf("blobRefs: %w", err)
+		}
+	}
 	return nil
+}
+
+// RequiredBlobDigests reports the attachments this document names, which the server must already
+// hold for the push to be accepted (SD7).
+func (fields *PageContentFields) RequiredBlobDigests(entityID string) ([]string, error) {
+	return fields.BlobRefs, nil
+}
+
+// auxiliaryStatements keeps `page_blob_refs` in step with the document that produced it.
+//
+// A replace rather than a merge: the reference set of a document is whatever its current version
+// says it is, so a picture deleted from a page has to stop being a reason to keep its bytes. The
+// delete runs even when the insert has nothing to add, which is also how a tombstoned body releases
+// what it used to hold.
+//
+// Both statements are queued into the same pipelined transaction as the row itself (see
+// WriteChanges), so a document and its references can never be separately visible.
+func (fields *PageContentFields) auxiliaryStatements(envelope ChangeEnvelope) []auxiliaryStatement {
+	statements := []auxiliaryStatement{{
+		sql:       `DELETE FROM page_blob_refs WHERE account_id = $1::uuid AND page_id = $2`,
+		arguments: []any{envelope.AccountID, fields.PageID},
+	}}
+
+	// A tombstoned body references nothing, whatever it still carries. Keeping its references would
+	// hold the bytes of a picture on a deleted page for as long as the tombstone survives.
+	if envelope.DeletedAt != nil || len(fields.BlobRefs) == 0 {
+		return statements
+	}
+
+	digests := make([][]byte, 0, len(fields.BlobRefs))
+	for _, reference := range fields.BlobRefs {
+		raw, err := blob.DecodeDigest(reference)
+		if err != nil {
+			// Unreachable: Validate has already refused a reference that is not a digest.
+			continue
+		}
+		digests = append(digests, raw)
+	}
+
+	statements = append(statements, auxiliaryStatement{
+		// One statement for the whole set rather than one per digest: a page with twenty pictures
+		// is one round trip in the pipeline instead of twenty.
+		sql: `INSERT INTO page_blob_refs (account_id, page_id, sha256)
+			SELECT $1::uuid, $2, digest FROM unnest($3::bytea[]) AS digest
+			ON CONFLICT DO NOTHING`,
+		arguments: []any{envelope.AccountID, fields.PageID, digests},
+	})
+	return statements
 }
 
 func (fields *PageContentFields) upsertStatement(envelope ChangeEnvelope, baseVersion int64) (string, []any) {

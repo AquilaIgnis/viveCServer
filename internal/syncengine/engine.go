@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -99,7 +100,7 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 			continue
 		}
 
-		currentByID, existingParentIDs, err := readBatchContext(ctx, transaction, request.Caller.AccountID, kind, run)
+		batchContext, err := readBatchContext(ctx, transaction, request.Caller.AccountID, kind, run)
 		if err != nil {
 			return nil, err
 		}
@@ -112,7 +113,7 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 
 			if kind.ParentKind != "" {
 				parentID := change.fields.ParentID()
-				_, storedParent := existingParentIDs[parentID]
+				_, storedParent := batchContext.parentIDs[parentID]
 				_, parentInThisBatch := acceptedIDsByKind[kind.ParentKind][parentID]
 				if !storedParent && !parentInThisBatch {
 					rejected = append(rejected, RejectedChange{
@@ -126,7 +127,38 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 				}
 			}
 
-			current, storedHere := currentByID[change.envelope.ID]
+			// SD7: the server refuses to hold a reference to bytes it does not have, which is what
+			// makes "attachments upload before the change referencing them" an invariant instead of
+			// a convention. The client uploads and pushes this entity again.
+			//
+			// Only a live entity is held to it. A tombstone naming a blob that has already been
+			// swept is exactly how a picture stops existing, and refusing that delete would leave a
+			// row the client can never retract.
+			if change.envelope.DeletedAt == nil && len(change.requiredBlobs) > 0 {
+				if missing := missingDigests(change.requiredBlobs, batchContext.storedBlobs); len(missing) > 0 {
+					rejected = append(rejected, RejectedChange{
+						Kind:    kind.Name,
+						ID:      change.envelope.ID,
+						Reason:  ReasonMissingBlob,
+						Message: describeMissingBlobs(missing),
+					})
+					continue
+				}
+
+				if checker, checksBlobs := change.fields.(store.BlobConsistencyChecker); checksBlobs {
+					if err := checker.CheckBlobPresence(change.envelope.ID, batchContext.storedBlobs); err != nil {
+						rejected = append(rejected, RejectedChange{
+							Kind:    kind.Name,
+							ID:      change.envelope.ID,
+							Reason:  ReasonMalformed,
+							Message: err.Error(),
+						})
+						continue
+					}
+				}
+			}
+
+			current, storedHere := batchContext.currentByID[change.envelope.ID]
 			switch {
 			case storedHere && current.Version != change.baseVersion:
 				// The entity moved on since the client last saw it. The current row travels with
@@ -216,17 +248,34 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 	return response, nil
 }
 
-// readBatchContext fetches everything one kind's run needs from the database in two queries: the
-// rows the batch is editing, and which of the parents it names already exist.
+// batchContext is everything one kind's run needs from the database, read once for the whole run.
+type batchContext struct {
+	// currentByID holds the stored rows the run is editing, for the version check.
+	currentByID map[string]store.CurrentChange
+
+	// parentIDs is which of the parents the run names already exist.
+	parentIDs map[string]struct{}
+
+	// storedBlobs is which of the attachment digests the run references are held by this account,
+	// and how large each one is.
+	storedBlobs map[string]store.BlobPresence
+}
+
+// readBatchContext fetches all of that in at most three queries.
+//
+// Three rather than three per entity: a push carries up to 512 changes, and a round trip each would
+// make the checks cost more than the writes they guard. Each query takes the run's ids as an array.
 func readBatchContext(
 	ctx context.Context,
 	database store.Querier,
 	accountID string,
 	kind *store.SyncKind,
 	run []decodedChange,
-) (map[string]store.CurrentChange, map[string]struct{}, error) {
+) (batchContext, error) {
 	entityIDs := make([]string, 0, len(run))
 	parentIDs := make([]string, 0, len(run))
+	requiredDigests := make([]string, 0)
+	seenDigests := make(map[string]struct{})
 	for _, change := range run {
 		if change.rejection != nil {
 			continue
@@ -235,26 +284,73 @@ func readBatchContext(
 		if kind.ParentKind != "" {
 			parentIDs = append(parentIDs, change.fields.ParentID())
 		}
+		if change.envelope.DeletedAt != nil {
+			continue
+		}
+		for _, digest := range change.requiredBlobs {
+			// Deduplicated across the run: one picture on twenty pages is one array element, not
+			// twenty, and the same document pushed with repeated refs cannot inflate the query.
+			if _, seen := seenDigests[digest]; seen {
+				continue
+			}
+			seenDigests[digest] = struct{}{}
+			requiredDigests = append(requiredDigests, digest)
+		}
 	}
 
 	currentByID, err := store.SelectCurrentChanges(ctx, database, kind, accountID, entityIDs)
 	if err != nil {
-		return nil, nil, err
+		return batchContext{}, err
 	}
 
 	existingParentIDs := map[string]struct{}{}
 	if kind.ParentKind != "" {
 		parentKind, known := store.SyncKindByName(kind.ParentKind)
 		if !known {
-			return nil, nil, fmt.Errorf("kind %q names an unregistered parent kind %q", kind.Name, kind.ParentKind)
+			return batchContext{}, fmt.Errorf("kind %q names an unregistered parent kind %q", kind.Name, kind.ParentKind)
 		}
 		existingParentIDs, err = store.SelectExistingIDs(ctx, database, parentKind, accountID, parentIDs)
 		if err != nil {
-			return nil, nil, err
+			return batchContext{}, err
 		}
 	}
 
-	return currentByID, existingParentIDs, nil
+	storedBlobs, err := store.SelectStoredBlobs(ctx, database, accountID, requiredDigests)
+	if err != nil {
+		return batchContext{}, err
+	}
+
+	return batchContext{currentByID: currentByID, parentIDs: existingParentIDs, storedBlobs: storedBlobs}, nil
+}
+
+// missingDigests reports which of an entity's required blobs this account does not hold.
+func missingDigests(required []string, stored map[string]store.BlobPresence) []string {
+	missing := make([]string, 0)
+	for _, digest := range required {
+		if _, held := stored[digest]; !held {
+			missing = append(missing, digest)
+		}
+	}
+	return missing
+}
+
+// describeMissingBlobs names what has to be uploaded.
+//
+// Every digest, not a count: the client's next move is to upload exactly these, and a message that
+// said "3 attachments are missing" would make it diff its own reference set to find out which.
+// Bounded because a rejection is not a place to return a page of data — the client can re-push and
+// be told about the rest, and a document naming 512 pictures none of which are stored is a broken
+// client rather than a case to optimise for.
+func describeMissingBlobs(missing []string) string {
+	const named = 8
+
+	listed := missing
+	suffix := ""
+	if len(listed) > named {
+		listed = listed[:named]
+		suffix = fmt.Sprintf(" and %d more", len(missing)-named)
+	}
+	return "upload these attachments before pushing this change: " + strings.Join(listed, ", ") + suffix
 }
 
 // PullChanges returns the changes an account accumulated after a client's cursor.

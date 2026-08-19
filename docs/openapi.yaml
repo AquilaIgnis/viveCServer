@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.4.0
+  version: 0.5.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -26,10 +26,14 @@ info:
     operations `inkErase` and `inkMove`. Their points are opaque bytes with an encoder id, the way a
     document body is, and each operation carries the ids of the strokes it affected inside itself.
     Ink conflicts are rare by construction rather than by rule — two devices never write the same
-    stroke id — so it takes the same optimistic concurrency path as everything else. Attachment
-    blobs are separate operations arriving in S5; they are not implemented and are deliberately
-    absent from this contract. Add them here when their handlers ship so generated clients never
-    treat planned operations as available ones.
+    stroke id — so it takes the same optimistic concurrency path as everything else.
+
+    Attachment bytes (S5) are addressed by content, at `/v1/blobs/{sha256}`, and are the one part of
+    a notebook that does not travel through the change protocol. Upload the bytes first, then push
+    the `attachment` row and the `pageContent` whose `blobRefs` name them: a change referencing a
+    digest the server does not hold is rejected `missing_blob`, so the server can never hold a
+    reference to bytes it cannot serve. Ask `HEAD /v1/blobs/{sha256}` before every upload — the same
+    picture on a second device is then one round trip rather than a second copy of the file.
 
 servers:
   - url: http://localhost:5444
@@ -46,6 +50,8 @@ tags:
     description: Device registration, authentication, listing, and revocation.
   - name: Sync
     description: Cursor, change pull, and change push for the notebook hierarchy.
+  - name: Attachments
+    description: Content-addressed attachment bytes, uploaded before the changes that reference them.
 
 paths:
   /healthz:
@@ -426,6 +432,166 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/blobs/{sha256}:
+    head:
+      operationId: checkBlob
+      tags: [Attachments]
+      summary: Ask whether the server already holds these bytes
+      description: |
+        The cheap half of deduplication, and the request a client makes before every upload. The
+        same picture inserted on nine pages, or already uploaded from another device, costs one round
+        trip instead of a second copy of the file.
+
+        Presence means both that this account holds the digest and that the bytes are on disk. A
+        server whose blob directory was lost answers 404 and the upload that repairs it follows,
+        rather than reporting a picture it can no longer serve.
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: "#/components/parameters/BlobDigest"
+      responses:
+        "204":
+          description: The account holds these bytes. Do not upload them again.
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: The digest, quoted.
+            Cache-Control:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          description: The account does not hold these bytes. Upload them.
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    put:
+      operationId: uploadBlob
+      tags: [Attachments]
+      summary: Upload attachment bytes under their digest
+      description: |
+        The body is the raw bytes, not JSON and not base64. They are hashed as they arrive and
+        refused if they do not hash to the digest in the URL, so a body truncated in transit becomes
+        a rejected upload rather than a stored file every device will fetch and fail to decode.
+
+        Send `Expect: 100-continue`. The server answers 204 for a picture it already holds without
+        waiting for the body, so a client that skipped the `HEAD` still does not transfer bytes
+        twice.
+
+        Uploading is idempotent: the same bytes under the same digest are stored once however many
+        devices send them, and the response says which case it was.
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: "#/components/parameters/BlobDigest"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: The bytes were stored. They can now be named by `blobRefs` and by an `attachment` id.
+          headers:
+            ETag:
+              schema:
+                type: string
+        "204":
+          description: The account already held these bytes; nothing was stored.
+          headers:
+            ETag:
+              schema:
+                type: string
+        "400":
+          description: |
+            The digest is not 64 lowercase hex characters, or the bytes do not hash to it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: invalid_request
+                message: the uploaded bytes do not hash to the digest in the URL
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "413":
+          description: |
+            The attachment is larger than the per-attachment cap, 32 MiB by default. That cap is the
+            only storage limit: there is no per-account quota.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: payload_too_large
+                message: an attachment may not exceed 33554432 bytes
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    get:
+      operationId: downloadBlob
+      tags: [Attachments]
+      summary: Download attachment bytes
+      description: |
+        Returns the bytes, with `Range`, `If-None-Match` and `If-Range` support: an interrupted
+        download resumes rather than restarting, and a client that already has the picture pays a
+        304. The response is `immutable` and may be cached for as long as the client likes, because
+        content addressed by its own hash cannot change — a different byte would be a different URL.
+
+        The media type is always `application/octet-stream`; the real one is on the `attachment` row
+        the client pulled. Holding a digest is not holding a blob: only an account that has itself
+        uploaded these bytes can read them.
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: "#/components/parameters/BlobDigest"
+      responses:
+        "200":
+          description: The bytes.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "206":
+          description: The requested range of the bytes.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The client's copy is current.
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          description: |
+            This account holds no such attachment. Also the answer when another account holds it, and
+            when the row exists but its bytes do not — in the second case, uploading again repairs it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "416":
+          description: The requested range lies outside the content.
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 components:
   securitySchemes:
     deviceToken:
@@ -435,6 +601,19 @@ components:
       description: Device token returned once by `POST /v1/devices`.
 
   parameters:
+    BlobDigest:
+      name: sha256
+      in: path
+      required: true
+      description: |
+        The SHA-256 of the bytes, as 64 lowercase hex characters. Uppercase is refused rather than
+        folded: this string is an identity — it is also the attachment's id and its `blobRefs`
+        entry — and two spellings of one identity is how one picture becomes two files.
+      schema:
+        type: string
+        pattern: "^[0-9a-f]{64}$"
+      example: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+
     DeviceID:
       name: deviceID
       in: path
@@ -724,11 +903,17 @@ components:
         `missing_parent` — the notebook or section it belongs to has not been uploaded. Push the
         parent, then retry this entity.
         `too_large` — a field is longer than the limit `.vive` bundles use for the same field.
+        `missing_blob` — the change names an attachment whose bytes the server does not hold. Upload
+        them to `/v1/blobs/{sha256}` and push the change again. It is the one rejection a client can
+        always clear on its own. A tombstone is never rejected for this: deleting a row whose bytes
+        have already gone is exactly how a picture stops existing.
         `malformed` — the change could not be read as the kind it claims to be, its id is unusable,
-        the same entity appeared twice in one batch, or the kind is one this server does not know.
+        the same entity appeared twice in one batch, an `attachment` declares a `byteCount` that is
+        not the size of the blob its id names, or the kind is one this server does not know.
       enum:
         - version_conflict
         - missing_parent
+        - missing_blob
         - too_large
         - malformed
 
@@ -736,7 +921,8 @@ components:
       type: string
       description: |
         Synced entity kinds, in apply order: a parent is always applied and emitted before its
-        children. Attachments join this list in S5.
+        children. `attachment` is last and has no parent — one picture can appear on several pages,
+        so there is no page that owns it.
       enum:
         - notebook
         - section
@@ -745,6 +931,7 @@ components:
         - inkStroke
         - inkErase
         - inkMove
+        - attachment
 
     ChangeEnvelope:
       type: object
@@ -820,6 +1007,7 @@ components:
         - $ref: "#/components/schemas/InkStrokeChange"
         - $ref: "#/components/schemas/InkEraseChange"
         - $ref: "#/components/schemas/InkMoveChange"
+        - $ref: "#/components/schemas/AttachmentChange"
       discriminator:
         propertyName: kind
         mapping:
@@ -830,6 +1018,7 @@ components:
           inkStroke: "#/components/schemas/InkStrokeChange"
           inkErase: "#/components/schemas/InkEraseChange"
           inkMove: "#/components/schemas/InkMoveChange"
+          attachment: "#/components/schemas/AttachmentChange"
 
     PushChange:
       description: |
@@ -843,6 +1032,7 @@ components:
         - $ref: "#/components/schemas/InkStrokePush"
         - $ref: "#/components/schemas/InkErasePush"
         - $ref: "#/components/schemas/InkMovePush"
+        - $ref: "#/components/schemas/AttachmentPush"
       discriminator:
         propertyName: kind
         mapping:
@@ -853,6 +1043,7 @@ components:
           inkStroke: "#/components/schemas/InkStrokePush"
           inkErase: "#/components/schemas/InkErasePush"
           inkMove: "#/components/schemas/InkMovePush"
+          attachment: "#/components/schemas/AttachmentPush"
 
     NotebookFields:
       type: object
@@ -954,6 +1145,23 @@ components:
           type: string
           maxLength: 128
           description: How `doc` is wrapped before storage. Absent means `none/1`, which is what the server returns.
+        blobRefs:
+          type: array
+          maxItems: 512
+          items:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+          description: |
+            The attachment digests this document references, extracted by the client while pushing.
+
+            The server cannot read `doc`, so this is the only way it can know which pictures a page
+            still shows — and therefore the only way it can ever free one. Every push replaces the
+            whole set, so removing a picture from a page is enough to release it.
+
+            **Upload the bytes first.** A push naming a digest the server does not hold is rejected
+            `missing_blob` and nothing is stored, which is what makes it impossible for the server to
+            hold a reference it cannot satisfy. Absent and empty mean the same thing, and a pull
+            always returns an array.
 
     InkStrokeFields:
       type: object
@@ -1135,6 +1343,47 @@ components:
           type: integer
           format: int64
 
+    AttachmentFields:
+      type: object
+      additionalProperties: true
+      required: [mimeType, pixelWidth, pixelHeight, byteCount, createdAt]
+      description: |
+        What is known about a picture. The pixels are not here and never travel through the change
+        protocol: they are uploaded to `/v1/blobs/{sha256}` first, and this row is rejected
+        `missing_blob` until they are.
+
+        **The entity id is the digest of the bytes** — the same lowercase hex SHA-256 that names the
+        blob and appears in `blobRefs`. There is deliberately no `sha256` field: a second place to
+        write an identity is a first opportunity for the two to disagree.
+
+        There is no `pageId`, because one picture can appear on several pages, and no `refCount`,
+        because reachability is a per-device count and each device computes its own.
+      properties:
+        mimeType:
+          type: string
+          maxLength: 255
+          description: Stored and returned, never dispatched on. Downloads are always `application/octet-stream`.
+        pixelWidth:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Dimensions of what was stored, after the client's import re-encode. Layout metadata; the server never decodes the picture.
+        pixelHeight:
+          type: integer
+          format: int32
+          minimum: 0
+        byteCount:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The size of the bytes. Checked against the stored blob on every push and rejected
+            `malformed` if it disagrees, the same way a document body that disagrees with its digest
+            is: a row that misdescribes what it names is the quiet kind of corruption.
+        createdAt:
+          type: integer
+          format: int64
+
     NotebookChange:
       allOf:
         - $ref: "#/components/schemas/ChangeEnvelope"
@@ -1172,6 +1421,11 @@ components:
         - $ref: "#/components/schemas/InkMoveFields"
         - $ref: "#/components/schemas/InkOperationTargets"
 
+    AttachmentChange:
+      allOf:
+        - $ref: "#/components/schemas/ChangeEnvelope"
+        - $ref: "#/components/schemas/AttachmentFields"
+
     NotebookPush:
       allOf:
         - $ref: "#/components/schemas/PushChangeEnvelope"
@@ -1208,6 +1462,11 @@ components:
         - $ref: "#/components/schemas/PushChangeEnvelope"
         - $ref: "#/components/schemas/InkMoveFields"
         - $ref: "#/components/schemas/InkOperationTargets"
+
+    AttachmentPush:
+      allOf:
+        - $ref: "#/components/schemas/PushChangeEnvelope"
+        - $ref: "#/components/schemas/AttachmentFields"
 
     RenameDeviceRequest:
       type: object

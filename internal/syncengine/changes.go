@@ -32,8 +32,11 @@ const (
 	// ReasonMalformed means the change could not be read as the kind it claims to be.
 	ReasonMalformed = "malformed"
 
-	// ReasonMissingBlob is not produced yet. It arrives with page content and attachments in S3/S5,
-	// and is named here so the closed set is visible in one place.
+	// ReasonMissingBlob means the entity names an attachment whose bytes this server does not hold.
+	// The client uploads them to `/v1/blobs/{sha256}` and pushes the entity again (SD7). It is the
+	// one rejection the client can always clear on its own, because it is the one that says the
+	// client has something the server has not been given yet.
+	ReasonMissingBlob = "missing_blob"
 )
 
 // MaxChangesPerBatch caps one push. The client paginates; the body limit in httpapi caps the other
@@ -73,6 +76,10 @@ type decodedChange struct {
 	envelope    store.ChangeEnvelope
 	fields      store.EntityFields
 	baseVersion int64
+
+	// requiredBlobs are the attachment digests this change may not be stored without (SD7). Read
+	// while decoding so that one query per kind can answer the whole run.
+	requiredBlobs []string
 
 	// rejection is set when the change was refused while being read, which is every reason that
 	// needs no database access. Such a change keeps its place in the ordering and is reported like
@@ -157,10 +164,22 @@ func decodeChange(raw json.RawMessage, seenEntities map[string]struct{}) decoded
 		return refuse(kind, kind.Name, envelope.ID, reasonFor(err), err.Error())
 	}
 
+	// Which blobs this change needs, if its kind needs any. Read here rather than in the engine so
+	// that an id which cannot be a digest is refused as malformed alongside every other shape
+	// failure, and never reaches a query as an argument that would find nothing.
+	var requiredBlobs []string
+	if referencing, referencesBlobs := fields.(store.BlobReferencingFields); referencesBlobs {
+		requiredBlobs, err = referencing.RequiredBlobDigests(envelope.ID)
+		if err != nil {
+			return refuse(kind, kind.Name, envelope.ID, reasonFor(err), err.Error())
+		}
+	}
+
 	return decodedChange{
-		kind:        kind,
-		baseVersion: envelope.BaseVersion,
-		fields:      fields,
+		kind:          kind,
+		baseVersion:   envelope.BaseVersion,
+		fields:        fields,
+		requiredBlobs: requiredBlobs,
 		envelope: store.ChangeEnvelope{
 			ID:        envelope.ID,
 			DeletedAt: envelope.DeletedAt,

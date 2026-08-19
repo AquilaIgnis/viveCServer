@@ -14,6 +14,8 @@ Use docs/docker-compose.yml and env sample
 
 # Dev
 
+> Refer to openapi.yml for server - client contract
+
 Local image build
 
 ```bash

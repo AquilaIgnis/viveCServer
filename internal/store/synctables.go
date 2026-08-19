@@ -79,6 +79,40 @@ type EntityFields interface {
 	upsertStatement(envelope ChangeEnvelope, baseVersion int64) (statement string, arguments []any)
 }
 
+// BlobReferencingFields is implemented by a kind whose row is only valid while the server holds
+// certain attachment blobs (SD7).
+//
+// An optional interface rather than a method on every kind: three of the eight kinds could not
+// answer it meaningfully, and a `return nil, nil` in each of them is five more places to look when
+// asking which kinds actually reference bytes.
+type BlobReferencingFields interface {
+	// RequiredBlobDigests returns the digests that must already be stored, in wire form. An error
+	// means the entity names something that cannot be a digest at all.
+	RequiredBlobDigests(entityID string) ([]string, error)
+}
+
+// BlobConsistencyChecker is implemented by a kind that has something more to say about the blobs it
+// references once they are known to be present.
+type BlobConsistencyChecker interface {
+	CheckBlobPresence(entityID string, present map[string]BlobPresence) error
+}
+
+// auxiliaryStatement is a write a kind makes outside its own table.
+type auxiliaryStatement struct {
+	sql       string
+	arguments []any
+}
+
+// auxiliaryWriter is implemented by a kind that maintains a second table alongside its own row —
+// today only `pageContent`, which keeps `page_blob_refs` in step with the document that names them.
+//
+// The statements are queued into the same transaction and the same pipeline as the row itself,
+// which is what makes "a document and its reference set are never separately visible" a property of
+// the design rather than of remembering to write both.
+type auxiliaryWriter interface {
+	auxiliaryStatements(envelope ChangeEnvelope) []auxiliaryStatement
+}
+
 // SyncKind describes one synced entity kind to the generic parts of the engine.
 type SyncKind struct {
 	// Name is the `kind` discriminator on the wire.
@@ -139,8 +173,9 @@ func IsReservedChangeKey(jsonKey string) bool {
 	return reserved
 }
 
-// syncKinds is the registry, in apply order. S3 adds page_content, S4 the ink kinds; each is one
-// entry here and one file beside this one.
+// syncKinds is the registry, in apply order. Each kind is one entry here and one file beside this
+// one — which is what page_content (S3), the three ink kinds (S4) and attachment (S5) each turned
+// out to cost.
 var syncKinds = []*SyncKind{
 	{
 		Name:       "notebook",
@@ -202,6 +237,19 @@ var syncKinds = []*SyncKind{
 		changeJSON: inkMoveChangeJSON,
 		newFields:  func() EntityFields { return &InkMoveFields{} },
 	},
+	// Attachments hang from nothing. One picture can appear on several pages, so there is no parent
+	// whose existence could be checked — what is checked instead is that the server holds the bytes
+	// the id names (SD7). Last in the apply order because a document that references a picture is
+	// only accepted once that picture's bytes are stored, and the bytes arrive over `/v1/blobs`
+	// before either row does.
+	{
+		Name:       "attachment",
+		Rank:       7,
+		Table:      "attachments",
+		ParentKind: "",
+		changeJSON: attachmentChangeJSON,
+		newFields:  func() EntityFields { return &AttachmentFields{} },
+	},
 }
 
 var syncKindsByName = func() map[string]*SyncKind {
@@ -262,8 +310,8 @@ func ValidateEntityID(id string) error {
 
 // accountLockNamespace separates this lock from every other advisory lock the server might take.
 //
-// PostgreSQL keeps the one-bigint and two-int4 advisory key spaces apart -- "note that these two
-// key spaces do not overlap" -- so a push lock can never collide with the single-key setup lock in
+// PostgreSQL keeps the one-bigint and two-int4 advisory key spaces apart — "note that these two
+// key spaces do not overlap" — so a push lock can never collide with the single-key setup lock in
 // accounts.go however the account hashes.
 const accountLockNamespace int32 = 0x56495645 // "VIVE"
 
@@ -444,23 +492,43 @@ func WriteChanges(ctx context.Context, transaction pgx.Tx, writes []PendingWrite
 		return nil
 	}
 
+	// queued mirrors the pipeline one for one, because every result has to be read back and only
+	// the guarded upserts are required to have affected a row: a kind's auxiliary statements may
+	// legitimately affect none, as clearing the references of a page that had none does.
+	type queuedResult struct {
+		kind     string
+		entityID string
+		guarded  bool
+	}
+
 	pipeline := &pgx.Batch{}
+	queued := make([]queuedResult, 0, len(writes))
 	for _, write := range writes {
 		statement, arguments := write.Fields.upsertStatement(write.Envelope, write.BaseVersion)
 		pipeline.Queue(statement, arguments...)
+		queued = append(queued, queuedResult{kind: write.Kind, entityID: write.Envelope.ID, guarded: true})
+
+		auxiliary, writesElsewhere := write.Fields.(auxiliaryWriter)
+		if !writesElsewhere {
+			continue
+		}
+		for _, statement := range auxiliary.auxiliaryStatements(write.Envelope) {
+			pipeline.Queue(statement.sql, statement.arguments...)
+			queued = append(queued, queuedResult{kind: write.Kind, entityID: write.Envelope.ID})
+		}
 	}
 
 	results := transaction.SendBatch(ctx, pipeline)
 	var firstError error
-	for _, write := range writes {
+	for _, write := range queued {
 		commandTag, err := results.Exec()
 		switch {
 		case firstError != nil:
 			// Already failed; the remaining results still have to be drained.
 		case err != nil:
-			firstError = fmt.Errorf("writing %s %q: %w", write.Kind, write.Envelope.ID, err)
-		case commandTag.RowsAffected() != 1:
-			firstError = fmt.Errorf("%w: %s %q", ErrConcurrentWrite, write.Kind, write.Envelope.ID)
+			firstError = fmt.Errorf("writing %s %q: %w", write.kind, write.entityID, err)
+		case write.guarded && commandTag.RowsAffected() != 1:
+			firstError = fmt.Errorf("%w: %s %q", ErrConcurrentWrite, write.kind, write.entityID)
 		}
 	}
 

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -35,6 +36,31 @@ func (w *statusRecordingWriter) Write(body []byte) (int, error) {
 
 func (w *statusRecordingWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
+}
+
+// ReadFrom keeps the zero-copy path reachable through this wrapper.
+//
+// `io.Copy` chooses `sendfile(2)` only when its destination implements io.ReaderFrom, and a wrapper
+// that does not implement it silently removes that choice: an attachment download would still be
+// correct, and every byte of every picture would be copied through this process instead of going
+// from the page cache to the socket. Wrapping a response is exactly the kind of change that would
+// cost that without anything failing, so the forwarding lives here rather than being remembered at
+// each call site.
+func (w *statusRecordingWriter) ReadFrom(source io.Reader) (int64, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+
+	readerFrom, canReadFrom := w.ResponseWriter.(io.ReaderFrom)
+	if !canReadFrom {
+		written, err := io.Copy(w.ResponseWriter, source)
+		w.bytesWritten += int(written)
+		return written, err
+	}
+
+	written, err := readerFrom.ReadFrom(source)
+	w.bytesWritten += int(written)
+	return written, err
 }
 
 // withRequestLogging records one line per request.

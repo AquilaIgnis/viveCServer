@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AquilaIgnis/viveCServer/internal/auth"
+	"github.com/AquilaIgnis/viveCServer/internal/blob"
+	"github.com/AquilaIgnis/viveCServer/internal/blobsweep"
 	"github.com/AquilaIgnis/viveCServer/internal/config"
 	"github.com/AquilaIgnis/viveCServer/internal/httpapi"
 	"github.com/AquilaIgnis/viveCServer/internal/store"
@@ -98,16 +103,33 @@ func discardingLogger() *slog.Logger {
 
 // syncFixture is one running sync listener and one account on it.
 type syncFixture struct {
-	t         *testing.T
-	pool      *pgxpool.Pool
-	baseURL   string
-	accountID string
-	email     string
+	t             *testing.T
+	pool          *pgxpool.Pool
+	baseURL       string
+	accountID     string
+	email         string
+	blobs         *blob.FileStore
+	blobDirectory string
 }
 
 func newSyncFixture(t *testing.T) *syncFixture {
 	t.Helper()
+	return newSyncFixtureWithBlobLimits(t, httpapi.BlobLimits{MaxBlobBytes: 32 << 20})
+}
+
+// newSyncFixtureWithBlobLimits is the same listener with the attachment cap a test chooses, so the
+// cap can be exercised without uploading a real 32 MB.
+func newSyncFixtureWithBlobLimits(t *testing.T, limits httpapi.BlobLimits) *syncFixture {
+	t.Helper()
 	pool := testPool(t)
+
+	// A directory per fixture, removed with the test. Attachment bytes are the one part of this
+	// server's state that is not in PostgreSQL, so they are the one part a test has to clean up.
+	blobDirectory := t.TempDir()
+	blobs, err := blob.OpenFileStore(blobDirectory)
+	if err != nil {
+		t.Fatalf("opening a test attachment store: %v", err)
+	}
 
 	handler := httpapi.NewSyncHandler(pool, discardingLogger(), httpapi.Options{
 		SignupMode: config.SignupModeClosed,
@@ -115,6 +137,9 @@ func newSyncFixture(t *testing.T) *syncFixture {
 		// Long enough that no test can age out of it while running, short enough to be a real value
 		// rather than "forever".
 		BatchReplayWindow: time.Hour,
+
+		Blobs:      blobs,
+		BlobLimits: limits,
 	})
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -129,7 +154,121 @@ func newSyncFixture(t *testing.T) *syncFixture {
 		t.Fatalf("creating a test account: %v", err)
 	}
 
-	return &syncFixture{t: t, pool: pool, baseURL: server.URL, accountID: accountID, email: email}
+	return &syncFixture{
+		t:             t,
+		pool:          pool,
+		baseURL:       server.URL,
+		accountID:     accountID,
+		email:         email,
+		blobs:         blobs,
+		blobDirectory: blobDirectory,
+	}
+}
+
+// newSyncFixtureOnStore is a second account on the same attachment directory as an existing
+// fixture, which is what two people self-hosting one server look like.
+func newSyncFixtureOnStore(t *testing.T, existing *syncFixture) *syncFixture {
+	t.Helper()
+	pool := testPool(t)
+
+	handler := httpapi.NewSyncHandler(pool, discardingLogger(), httpapi.Options{
+		SignupMode:        config.SignupModeClosed,
+		BatchReplayWindow: time.Hour,
+		Blobs:             existing.blobs,
+		BlobLimits:        httpapi.BlobLimits{MaxBlobBytes: 32 << 20},
+	})
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	passwordHash, err := auth.HashPassword(testAccountPassword)
+	if err != nil {
+		t.Fatalf("hashing the test password: %v", err)
+	}
+	email := "s5-" + randomToken(t) + "@example.test"
+	accountID, err := store.CreateAccount(context.Background(), pool, email, passwordHash)
+	if err != nil {
+		t.Fatalf("creating a test account: %v", err)
+	}
+
+	return &syncFixture{
+		t:             t,
+		pool:          pool,
+		baseURL:       server.URL,
+		accountID:     accountID,
+		email:         email,
+		blobs:         existing.blobs,
+		blobDirectory: existing.blobDirectory,
+	}
+}
+
+// accountStorageBytes is what the account is charged for its attachments, which is also what the
+// admin dashboard's storage tile reads.
+func (fixture *syncFixture) accountStorageBytes() int64 {
+	fixture.t.Helper()
+
+	storageBytes, err := store.AccountStorageBytes(context.Background(), fixture.pool, fixture.accountID)
+	if err != nil {
+		fixture.t.Fatalf("reading account storage: %v", err)
+	}
+	return storageBytes
+}
+
+// storedBlobFiles counts the files the attachment store actually holds, ignoring its staging
+// directory. Counting files is how a dedup test says "once" rather than "the API said 204".
+func (fixture *syncFixture) storedBlobFiles() int {
+	fixture.t.Helper()
+
+	stored := 0
+	err := filepath.WalkDir(fixture.blobDirectory, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == "staging" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		stored++
+		return nil
+	})
+	if err != nil {
+		fixture.t.Fatalf("walking the attachment store: %v", err)
+	}
+	return stored
+}
+
+// sweepAttachments collects unreferenced attachments with the retention a test chooses.
+//
+// **Two passes, because the sweep is two-phase on purpose.** The first marks what nothing points at
+// and the second deletes what has been marked for longer than the retention — and one pass can
+// never do both, since `now()` is fixed for a transaction and a row marked at that instant is not
+// yet older than it. A server runs these on consecutive ticks; a test would rather not wait an hour
+// to see the second one.
+//
+// The pass is global, as the server's own is: these tests share one database, so a sweep here also
+// collects what earlier tests left unreferenced. That is why the assertions around it are about
+// observable state — which files this fixture's directory holds, what this account's devices can
+// still fetch — rather than about the counters the sweep returns.
+func (fixture *syncFixture) sweepAttachments(retention time.Duration) store.SweepCounts {
+	fixture.t.Helper()
+
+	sweeper := blobsweep.NewSweeper(fixture.pool, fixture.blobs, discardingLogger(), time.Hour, retention)
+
+	var counts store.SweepCounts
+	for range 2 {
+		pass, err := sweeper.SweepOnce(context.Background())
+		if err != nil {
+			fixture.t.Fatalf("sweeping attachments: %v", err)
+		}
+		counts.ReferencesPruned += pass.ReferencesPruned
+		counts.Marked += pass.Marked
+		counts.Unmarked += pass.Unmarked
+		counts.RowsDeleted += pass.RowsDeleted
+		counts.FilesDeleted += pass.FilesDeleted
+		counts.BytesFreed += pass.BytesFreed
+	}
+	return counts
 }
 
 // registerDevice goes through the real registration endpoint rather than inserting a row, so every
@@ -320,6 +459,76 @@ func changesByID(changes []map[string]any) map[string]map[string]any {
 	return byID
 }
 
+// blobResponse is one answer from the byte routes: enough to assert on a status, a header and a
+// body without three helpers that each return a different third of it.
+type blobResponse struct {
+	status int
+	body   []byte
+	header http.Header
+}
+
+// uploadBlob PUTs bytes under a digest the caller chooses, so a test can also send the wrong one.
+func (device *deviceClient) uploadBlob(digest string, content []byte) blobResponse {
+	device.t.Helper()
+	return device.blobRequest(http.MethodPut, digest, content, nil)
+}
+
+func (device *deviceClient) blobPresence(digest string) blobResponse {
+	device.t.Helper()
+	return device.blobRequest(http.MethodHead, digest, nil, nil)
+}
+
+func (device *deviceClient) downloadBlob(digest string) blobResponse {
+	device.t.Helper()
+	return device.blobRequest(http.MethodGet, digest, nil, nil)
+}
+
+func (device *deviceClient) downloadBlobWithHeaders(digest string, headers map[string]string) blobResponse {
+	device.t.Helper()
+	return device.blobRequest(http.MethodGet, digest, nil, headers)
+}
+
+func (device *deviceClient) blobRequest(method string, digest string, content []byte, headers map[string]string) blobResponse {
+	device.t.Helper()
+
+	var body io.Reader
+	if content != nil {
+		body = bytes.NewReader(content)
+	}
+	request, err := http.NewRequest(method, device.fixture.baseURL+"/v1/blobs/"+digest, body)
+	if err != nil {
+		device.t.Fatalf("%s blob request: %v", device.name, err)
+	}
+	if device.token != "" {
+		request.Header.Set("Authorization", "Bearer "+device.token)
+	}
+	if content != nil {
+		request.Header.Set("Content-Type", "application/octet-stream")
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		device.t.Fatalf("%s %s /v1/blobs: %v", device.name, method, err)
+	}
+	defer response.Body.Close()
+
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		device.t.Fatalf("%s reading a blob response: %v", device.name, err)
+	}
+	return blobResponse{status: response.StatusCode, body: responseBody, header: response.Header}
+}
+
+// digestOf is the identity a picture has everywhere in this server: its lowercase hex SHA-256, which
+// is its blob URL, its `blobRefs` entry and its attachment id all at once.
+func digestOf(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
 func randomToken(t *testing.T) string {
 	t.Helper()
 	raw := make([]byte, 8)
@@ -398,6 +607,36 @@ func pageContentChange(pageID string, baseVersion int64, doc []byte) map[string]
 		"pageId":      pageID,
 		"doc":         doc,
 		"format":      "json/1",
+	}
+}
+
+// pageContentChangeWithBlobs is a body that names the attachments it shows (SD7).
+func pageContentChangeWithBlobs(pageID string, baseVersion int64, doc []byte, blobRefs ...string) map[string]any {
+	change := pageContentChange(pageID, baseVersion, doc)
+	change["blobRefs"] = blobRefs
+	return change
+}
+
+// deletedPageContentChange tombstones a body, which is how a page stops referencing its pictures.
+func deletedPageContentChange(pageID string, baseVersion int64) map[string]any {
+	change := pageContentChange(pageID, baseVersion, []byte{})
+	change["deletedAt"] = 1_700_000_100_000
+	return change
+}
+
+// attachmentChange is what is known about a picture. Its id is the digest of the bytes, because the
+// app's own primary key for an attachment is exactly that.
+func attachmentChange(digest string, baseVersion int64, byteCount int64) map[string]any {
+	return map[string]any{
+		"kind":        "attachment",
+		"id":          digest,
+		"baseVersion": baseVersion,
+		"updatedAt":   1_700_000_000_000,
+		"mimeType":    "image/jpeg",
+		"pixelWidth":  640,
+		"pixelHeight": 400,
+		"byteCount":   byteCount,
+		"createdAt":   1_700_000_000_000,
 	}
 }
 

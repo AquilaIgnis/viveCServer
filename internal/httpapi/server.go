@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/AquilaIgnis/viveCServer/internal/blob"
 	"github.com/AquilaIgnis/viveCServer/internal/config"
 	"github.com/AquilaIgnis/viveCServer/internal/livelog"
 )
@@ -23,6 +24,24 @@ type Options struct {
 
 	// How long a push response stays replayable for the device that sent it.
 	BatchReplayWindow time.Duration
+
+	// Blobs is where attachment bytes are kept. A handler that finds it nil serves the sync
+	// protocol without the byte routes, which is what the admin surface and any test that does not
+	// care about attachments get.
+	Blobs blob.Store
+
+	BlobLimits BlobLimits
+}
+
+// BlobLimits bounds attachment storage.
+//
+// One number, and deliberately not two: there is no per-account quota, because this is a personal
+// server (syncPlan.md §12 decision 1). The disk is the limit, and a quota would only turn "full
+// disk" into "refused earlier" for the one person who owns both.
+type BlobLimits struct {
+	// MaxBlobBytes caps one attachment. Mirrors NotebookTransferManager's own 32 MB ceiling, so a
+	// notebook that imports from a `.vive` bundle also syncs (syncPlan.md §6).
+	MaxBlobBytes int64
 }
 
 // NewSyncHandler builds the device/sync routing tree with its middleware already wrapped around it.
@@ -44,6 +63,19 @@ func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) ht
 	mux.Handle("GET /v1/devices", authenticated(handleListDevices(pool, logger)))
 	mux.Handle("PATCH /v1/devices/{deviceID}", authenticated(handleRenameDevice(pool, logger)))
 	mux.Handle("DELETE /v1/devices/{deviceID}", authenticated(handleRevokeDevice(pool, logger)))
+
+	// Attachment bytes. Registered only when there is somewhere to put them, so a build without a
+	// blob directory answers 404 rather than 500.
+	//
+	// The HEAD pattern is registered beside the GET one although Go's mux already routes HEAD to a
+	// GET pattern. It matches a strict subset of that pattern's requests, so it takes precedence
+	// without conflicting — and it exists because presence is a different question from content:
+	// the answer is 204 or 404 and it must never open the file or stream a byte.
+	if options.Blobs != nil {
+		mux.Handle("HEAD "+blobPathPrefix+"{digest}", authenticated(handleBlobPresence(pool, logger, options.Blobs)))
+		mux.Handle("PUT "+blobPathPrefix+"{digest}", authenticated(handleUploadBlob(pool, logger, options.Blobs, options.BlobLimits)))
+		mux.Handle("GET "+blobPathPrefix+"{digest}", authenticated(handleDownloadBlob(pool, logger, options.Blobs)))
+	}
 
 	mux.Handle("GET /v1/cursor", authenticated(handleReadCursor(pool, logger)))
 	mux.Handle("GET /v1/changes", authenticated(handlePullChanges(pool, logger)))

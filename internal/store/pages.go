@@ -2,9 +2,8 @@ package store
 
 // PageFields is the page-specific half of a synced change, matching PageEntity in the app.
 //
-// The document body is not here. It lives in `page_content`, which is a separate synced kind
-// arriving in S3, exactly as the app splits it so that listing a section's pages never loads every
-// document.
+// The document body is not here. It lives in `page_content`, which is a separate synced kind of its
+// own, exactly as the app splits it so that listing a section's pages never loads every document.
 type PageFields struct {
 	SectionID string `json:"sectionId"`
 	Title     string `json:"title"`

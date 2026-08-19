@@ -21,8 +21,13 @@ CREATE TABLE accounts (
     -- one, and the row it wrote is then invisible to that reader for ever. See syncPlan.md SD2.
     change_seq    bigint      NOT NULL DEFAULT 0,
 
-    -- Running total for the per-account quota (S6). Maintained alongside blob writes rather than
-    -- summed on demand, because the sum would walk every blob on every upload.
+    -- Running total of what this account's attachments occupy. Maintained alongside blob writes
+    -- rather than summed on demand, because the sum would walk every blob on every upload.
+    --
+    -- Written for a per-account quota, which was built in S5 and removed the same day: this is a
+    -- personal server and the disk is the limit (syncPlan.md §12 decision 1). The column stayed
+    -- because the admin dashboard reports it. It is a figure, not a limit — nothing refuses a write
+    -- on the strength of it.
     storage_bytes bigint      NOT NULL DEFAULT 0
 );
 
