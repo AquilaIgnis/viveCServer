@@ -2,9 +2,8 @@ name: Publish container
 
 on:
   push:
-    branches: [master]
-    tags: ["v*"]
-  workflow_dispatch:
+    # Creating a tag in GitHub and pushing a tag from git both arrive as tag push events.
+    tags: ["**"]
 
 permissions:
   contents: read
@@ -14,14 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Test
-        run: go test ./...
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -41,7 +32,8 @@ jobs:
         with:
           images: acidburnmonkey/vive-cserver
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha

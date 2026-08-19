@@ -1,8 +1,8 @@
 name: CI
 
 on:
+  # Every branch and tag push is tested. Pull requests remain covered before they merge.
   push:
-    branches: [master]
   pull_request:
 
 jobs:
