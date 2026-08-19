@@ -1,6 +1,7 @@
-# Self-hosting stack. The application image is prebuilt; only Docker and Compose are required.
+# Local build/test stack. The application image is built from this repository; Docker Compose does
+# not pull a viveCServer image from Docker Hub.
 #
-#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f deploy/docker-compose.yml up --build -d
 #   open http://localhost:8080
 #
 # PostgreSQL is private to this Compose network. VIVE_POSTGRES_PASSWORD can override the local-only
@@ -25,7 +26,11 @@ services:
     restart: unless-stopped
 
   vivecserver:
-    image: ${VIVE_SERVER_IMAGE:-acidburnmonkey/vive-cserver:latest}
+    image: vivecserver:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    pull_policy: build
     environment:
       VIVE_DATABASE_URL: postgres://vive:${VIVE_POSTGRES_PASSWORD:-vive-local-only}@postgres:5432/vive?sslmode=disable
       VIVE_ADMIN_LISTEN_ADDR: ':8080'

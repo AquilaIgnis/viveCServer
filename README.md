@@ -8,7 +8,7 @@ payloads, and everything that needs the document model runs on the client.
 
 # Deploy with docker
 
-Copy deploy/docker-compose.yml (not the .dev YAML):
+Use docs/docker-compose.yml and env sample
 
 `docker compose up -d`
 
@@ -20,5 +20,6 @@ Local image build
   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up --build -d
 ```
 
-web interface over: ` http://localhost:8080`
+Web interface over: ` http://localhost:8080`
+
 Android emulator: `http://10.0.2.2:5444`
