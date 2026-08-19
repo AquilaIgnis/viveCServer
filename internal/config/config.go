@@ -145,7 +145,7 @@ func readDurationSetting(settingName string, fallbackValue time.Duration) (time.
 // readSignupModeSetting refuses an unrecognised value rather than falling back to the default.
 //
 // A typo in this particular setting is the difference between a closed server and an open one, and
-// silently defaulting would mean `VIVE_SIGNUP_MODE=opne` reads as closed while its author believes
+// silently defaulting would mean `VIVE_SIGNUP_MODE=open` reads as closed while its author believes
 // it reads as open. Whichever way that mistake resolves, it should be loud.
 func readSignupModeSetting(settingName string, fallbackValue SignupMode) (SignupMode, error) {
 	raw := readStringSetting(settingName, "")

@@ -161,7 +161,7 @@ func handlePushChanges(pool *pgxpool.Pool, logger *slog.Logger, replayWindow tim
 
 // readIntegerQuery parses one bounded integer query parameter.
 //
-// An unparseable or out-of-range value is refused rather than clamped. A client that asked for
+// An unparsable or out-of-range value is refused rather than clamped. A client that asked for
 // `limit=100000` and silently received 2048 would page through a notebook believing it had seen all
 // of it.
 func readIntegerQuery(r *http.Request, name string, fallback int64, minimum int64, maximum int64) (int64, error) {
