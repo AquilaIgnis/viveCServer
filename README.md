@@ -6,6 +6,8 @@ small Go service backed by PostgreSQL and distributed as a prebuilt container im
 The server stores, orders, and authorises. It never interprets a note: page documents are opaque
 payloads, and everything that needs the document model runs on the client.
 
+![](1.png)
+
 # Deploy with docker
 
 Use docs/docker-compose.yml and env sample
