@@ -15,5 +15,11 @@ import "embed"
 // migration leaves every database that ran the old text silently different from every database that
 // runs the new one. Add a migration instead.
 //
+// `00001_initial_schema.sql` is the whole schema as one baseline, squashed from the nine migrations
+// that built it while the only databases that had ever run them were the developer's own. That was
+// allowed exactly once, before release, because "never edited once released" had nothing to bind on
+// yet: no database existed that could disagree with the new text. It is not a precedent, and the
+// rule above governs this file like any other from here on.
+//
 //go:embed *.sql
 var Files embed.FS

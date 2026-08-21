@@ -189,5 +189,5 @@ func inkEncodingOr(encoding string) string {
 	return encoding
 }
 
-// defaultInkEncoding is `InkCodec`'s only encoder id, and the column default in migration 00005.
+// defaultInkEncoding is `InkCodec`'s only encoder id, and the column default on `ink_strokes.enc`.
 const defaultInkEncoding = "ink/v1"

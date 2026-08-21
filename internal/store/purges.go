@@ -2,11 +2,10 @@ package store
 
 // The purge log: what this account has erased for good, and what still has to be told about it.
 //
-// Every other delete the protocol carries is a tombstone (migrations/00003), which works because
-// the row survives to describe itself. Permanent deletion removes the rows, so the sentence "this
-// id is gone" has to live somewhere else, and that is here. See migrations/00009_purges.sql for why
-// one table serves both as the queue a client drains and as the gravestone a push is refused
-// against.
+// Every other delete the protocol carries is a tombstone, which works because the row survives to
+// describe itself. Permanent deletion removes the rows, so the sentence "this id is gone" has to
+// live somewhere else, and that is here. See the `purges` table in migrations/ for why one table
+// serves both as the queue a client drains and as the gravestone a push is refused against.
 
 import (
 	"context"

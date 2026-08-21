@@ -52,7 +52,7 @@ var ErrDigestMismatch = errors.New("doc does not match docSha256")
 // holds a binary framing in reserve for ink, which is where the volume actually is.
 type PageContentFields struct {
 	// PageID is the page this body belongs to. One body per page is a database constraint rather
-	// than a convention here — see migration 00004.
+	// than a convention here — see `page_content`'s UNIQUE (account_id, page_id).
 	PageID string `json:"pageId"`
 
 	Doc []byte `json:"doc"`

@@ -270,7 +270,7 @@ func TestStopHostingACloudNotebookDeletesItThroughTheOrdinaryPath(t *testing.T) 
 		}
 		// One more, presenting the cursor the tombstone arrived at. Receiving a response is not an
 		// acknowledgement -- it can be lost on the way -- so the server only counts a device as
-		// having the deletion once the device asks for what comes after it (migration 00006).
+		// having the deletion once the device asks for what comes after it (devices.last_pulled_seq).
 		pull.device.pull(cursor, 100)
 	}
 
