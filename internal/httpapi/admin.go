@@ -129,6 +129,8 @@ func (application adminApplication) handler(pool *pgxpool.Pool) http.Handler {
 	// Registered from the same values the pages link to, so the router and the markup cannot drift.
 	mux.HandleFunc("GET "+adminStylesheetPath, application.handleStylesheet)
 	mux.HandleFunc("GET "+adminScriptPath, application.handleAdminScript)
+	mux.HandleFunc("GET "+notebookIcon.Path, application.handleIcon(notebookIcon))
+	mux.HandleFunc("GET "+cloudNotebookIcon.Path, application.handleIcon(cloudNotebookIcon))
 	mux.HandleFunc("GET /{$}", application.handleRoot)
 	mux.HandleFunc("GET /setup", application.handleSetupPage)
 	mux.HandleFunc("POST /setup", application.handleSetup)
@@ -424,11 +426,10 @@ func notebookViewsOf(notebooks []store.NotebookSummary) []adminNotebookView {
 	views := make([]adminNotebookView, 0, len(notebooks))
 	for _, notebook := range notebooks {
 		views = append(views, adminNotebookView{
-			ID:                   notebook.ID,
-			Name:                 notebook.Name,
-			UpdatedAt:            formatAdminTime(notebook.ServerUpdatedAt),
-			Closed:               notebook.Closed,
-			CanPermanentlyDelete: notebook.ReadyForPermanentDeletion,
+			ID:        notebook.ID,
+			Name:      notebook.Name,
+			UpdatedAt: formatAdminTime(notebook.ServerUpdatedAt),
+			Closed:    notebook.Closed,
 		})
 	}
 	return views
@@ -577,11 +578,13 @@ func (application adminApplication) handleRemoveRevokedDevices(w http.ResponseWr
 	redirectToDeviceList(w, r)
 }
 
-// handleDeleteArchivedNotebook permanently removes one acknowledged notebook tombstone.
+// handleDeleteArchivedNotebook permanently removes one archived notebook.
 //
-// The store refuses a live row and a tombstone that any active device has not pulled yet. That
-// second check is what keeps this housekeeping action from erasing the only copy of a delete before
-// an offline client can observe it.
+// It takes effect immediately and no device can hold it back. What used to keep an offline device
+// from missing the deletion was making the operator wait for it; what does it now is the purge the
+// store records in the account's change stream, which says "this id is gone" for as long as any
+// device might still be holding the notebook. The store refuses only a live row, because permanent
+// deletion is the housekeeping that follows a deletion rather than a second way to perform one.
 func (application adminApplication) handleDeleteArchivedNotebook(w http.ResponseWriter, r *http.Request) {
 	account, plainSessionToken, ok := application.requireAdminSession(w, r)
 	if !ok {
@@ -597,13 +600,6 @@ func (application adminApplication) handleDeleteArchivedNotebook(w http.Response
 
 	notebookID := r.PostFormValue("notebook_id")
 	err := application.store.DeleteArchivedNotebook(r.Context(), account.ID, notebookID)
-	if errors.Is(err, store.ErrNotebookDeletionNotSynced) {
-		application.writeAdminPage(w, http.StatusConflict, adminErrorTemplate, adminErrorPageData{
-			Title:   "Deletion is still syncing",
-			Message: "Wait for every active device to sync before permanently deleting this notebook. Revoke a device first if it is no longer in use.",
-		})
-		return
-	}
 	if errors.Is(err, store.ErrNotebookNotArchived) {
 		application.writeAdminPage(w, http.StatusConflict, adminErrorTemplate, adminErrorPageData{
 			Title:   "Notebook is not archived",
@@ -633,7 +629,7 @@ func (application adminApplication) handleDeleteArchivedNotebook(w http.Response
 // there because the device asking no longer holds the contents, which leaves this as the only place
 // the account can say it is finished with one. It writes an ordinary tombstone, so the notebook
 // travels to the Archived tab by the same route as any client deletion and is erased for good by
-// the same interlocked action.
+// the same action.
 func (application adminApplication) handleStopHostingCloudNotebook(w http.ResponseWriter, r *http.Request) {
 	account, plainSessionToken, ok := application.requireAdminSession(w, r)
 	if !ok {
@@ -862,7 +858,11 @@ func clearCookie(w http.ResponseWriter, r *http.Request, name string) {
 
 func withAdminSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		// `img-src 'self'` is what lets the notebook drawings load at all: the default is `none`,
+		// which covers images too, so adding an <img> without amending this renders an alt-text
+		// stub and a console warning rather than an icon. Still no `data:` and no remote host --
+		// the only images this panel has are served from this binary.
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")

@@ -23,8 +23,6 @@ type NotebookSummary struct {
 	// between a notebook nobody has opened lately and one the account has deliberately shelved —
 	// and because it is what decides whether a client's delete erases this row or keeps it here.
 	Closed bool
-
-	ReadyForPermanentDeletion bool
 }
 
 var (
@@ -34,10 +32,6 @@ var (
 	// ErrNotebookNotArchived protects a live notebook from an admin action that is only rendered
 	// for tombstones. The store repeats the check because HTTP markup is not an authority boundary.
 	ErrNotebookNotArchived = errors.New("notebook is not archived")
-
-	// ErrNotebookDeletionNotSynced means at least one active device has not pulled through the
-	// tombstone yet. Erasing it now would make that device miss the delete forever.
-	ErrNotebookDeletionNotSynced = errors.New("notebook deletion has not reached every active device")
 )
 
 // Which shelf a notebook is on, as the overview query numbers them. The numbers are the display
@@ -77,11 +71,9 @@ type NotebookOverviewResult struct {
 var notebookOverviewStatement = fmt.Sprintf(`
 	WITH shelved AS (
 		SELECT
-			account_id,
 			id,
 			name,
 			server_updated_at,
-			change_seq,
 			closed_at IS NOT NULL AS closed,
 			CASE
 				WHEN deleted_at IS NOT NULL THEN %[1]d
@@ -97,13 +89,6 @@ var notebookOverviewStatement = fmt.Sprintf(`
 			server_updated_at,
 			closed,
 			shelf,
-			NOT EXISTS (
-				SELECT 1
-				FROM devices
-				WHERE devices.account_id = shelved.account_id
-					AND devices.revoked_at IS NULL
-					AND devices.last_pulled_seq < shelved.change_seq
-			) AS ready_for_permanent_deletion,
 			count(*) OVER (PARTITION BY shelf) AS total,
 			row_number() OVER (
 				PARTITION BY shelf
@@ -114,7 +99,7 @@ var notebookOverviewStatement = fmt.Sprintf(`
 			) AS position
 		FROM shelved
 	)
-	SELECT id, name, server_updated_at, closed, shelf, ready_for_permanent_deletion, total
+	SELECT id, name, server_updated_at, closed, shelf, total
 	FROM ranked
 	WHERE position <= $2
 	ORDER BY shelf, position`,
@@ -152,7 +137,6 @@ func NotebookOverview(ctx context.Context, pool *pgxpool.Pool, accountID string,
 			&summary.ServerUpdatedAt,
 			&summary.Closed,
 			&shelf,
-			&summary.ReadyForPermanentDeletion,
 			&groupCount,
 		); err != nil {
 			return NotebookOverviewResult{}, fmt.Errorf("listing notebooks: %w", err)
@@ -177,15 +161,25 @@ func NotebookOverview(ctx context.Context, pool *pgxpool.Pool, accountID string,
 	return overview, nil
 }
 
-// DeleteArchivedNotebook permanently removes one notebook and everything beneath it.
+// DeleteArchivedNotebook permanently removes one notebook and everything beneath it, and records
+// the purge that tells the devices.
 //
 // PostgreSQL owns the subtree deletion: notebooks -> sections -> pages -> page_content and every
 // ink table are all ON DELETE CASCADE foreign keys. Keeping this operation as one root DELETE makes
 // a newly added child table fail closed unless its migration also declares how it is deleted.
 //
-// The account advisory lock serialises this with sync pushes. Under that lock, the function first
-// proves the row is a tombstone and then proves every active device has pulled through its change
-// sequence. Revoked devices can never pull again and therefore do not block housekeeping.
+// **The devices have no say in this and are not waited for.** This action used to be refused until
+// every active device had pulled through the tombstone, on the reasoning that erasing the tombstone
+// sooner would let an offline device miss the deletion for ever. The reasoning was right and the
+// remedy was wrong: it gave a tablet in a drawer a veto over the account owner's disk, and the
+// notebook the owner wanted gone stayed until the tablet came back. A purge row says what a missing
+// tombstone cannot — "this id is gone, drop it if you have it" — so the deletion happens now, the
+// account cursor moves, and every device is told the next time it connects. See purges.go.
+//
+// The account advisory lock serialises this with sync pushes, which is what lets the purge take a
+// sequence value of its own in the same order every other write takes one. Under that lock the row
+// is still proved to be a tombstone: an archived notebook is one the account already asked to
+// delete, and permanent deletion is the housekeeping that follows, not a second way to delete.
 func DeleteArchivedNotebook(ctx context.Context, pool *pgxpool.Pool, accountID string, notebookID string) error {
 	if err := ValidateEntityID(notebookID); err != nil {
 		return ErrNotebookNotFound
@@ -198,14 +192,13 @@ func DeleteArchivedNotebook(ctx context.Context, pool *pgxpool.Pool, accountID s
 	defer func() { _ = transaction.Rollback(ctx) }()
 
 	const notebookStatement = `
-		SELECT deleted_at, change_seq
+		SELECT deleted_at
 		FROM notebooks
 		WHERE account_id = $1::uuid AND id = $2
 		FOR UPDATE`
 
 	var deletedAt *int64
-	var deletionChangeSeq int64
-	err = transaction.QueryRow(ctx, notebookStatement, accountID, notebookID).Scan(&deletedAt, &deletionChangeSeq)
+	err = transaction.QueryRow(ctx, notebookStatement, accountID, notebookID).Scan(&deletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotebookNotFound
 	}
@@ -216,22 +209,6 @@ func DeleteArchivedNotebook(ctx context.Context, pool *pgxpool.Pool, accountID s
 		return ErrNotebookNotArchived
 	}
 
-	const pendingDeviceStatement = `
-		SELECT EXISTS (
-			SELECT 1
-			FROM devices
-			WHERE account_id = $1::uuid
-				AND revoked_at IS NULL
-				AND last_pulled_seq < $2
-		)`
-	var hasPendingDevice bool
-	if err := transaction.QueryRow(ctx, pendingDeviceStatement, accountID, deletionChangeSeq).Scan(&hasPendingDevice); err != nil {
-		return fmt.Errorf("checking devices before permanent notebook deletion: %w", err)
-	}
-	if hasPendingDevice {
-		return ErrNotebookDeletionNotSynced
-	}
-
 	result, err := transaction.Exec(ctx,
 		`DELETE FROM notebooks WHERE account_id = $1::uuid AND id = $2`,
 		accountID, notebookID,
@@ -240,8 +217,26 @@ func DeleteArchivedNotebook(ctx context.Context, pool *pgxpool.Pool, accountID s
 		return fmt.Errorf("permanently deleting an archived notebook: %w", err)
 	}
 	if result.RowsAffected() != 1 {
+		// Unreachable: the row was locked FOR UPDATE one statement ago.
 		return ErrNotebookNotFound
 	}
+
+	// Pruned before the new purge is written, so the row this deletion is about is never a
+	// candidate: no device can have acknowledged a sequence value that has not been allocated yet.
+	// Doing it here rather than in a sweeper keeps the log's whole lifecycle in the one operation
+	// that creates it.
+	if err := PrunePurges(ctx, transaction, accountID); err != nil {
+		return err
+	}
+
+	allocatedSeq, err := AllocateChangeSeq(ctx, transaction, accountID)
+	if err != nil {
+		return err
+	}
+	if err := RecordPurge(ctx, transaction, accountID, "notebook", notebookID, allocatedSeq); err != nil {
+		return err
+	}
+
 	if err := transaction.Commit(ctx); err != nil {
 		return fmt.Errorf("committing permanent notebook deletion: %w", err)
 	}
@@ -269,8 +264,8 @@ var ErrNotebookNotCloudHosted = errors.New("notebook is not hosted only on this 
 // devices still hold the notebook's skeleton — its sections and pages, which a cloud-only notebook
 // deliberately leaves behind — and a row that is simply gone cannot be described to them. So this
 // takes the ordinary path instead: the account's advisory lock, a sequence value of its own, a
-// version bump, and the row goes on to appear under Archived, where the existing interlock waits
-// for every active device to acknowledge the deletion before anything is erased for good.
+// version bump, and the row goes on to appear under Archived, where [DeleteArchivedNotebook] can
+// erase it and the purge log describes what is left.
 //
 // `last_writer` is cleared rather than attributed. No device wrote this, and naming one would put a
 // lie in the only column that answers "which of my tablets did that?".

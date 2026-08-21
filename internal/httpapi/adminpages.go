@@ -7,6 +7,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+
+	"github.com/AquilaIgnis/viveCServer/assets"
 )
 
 // assetCacheControl is as aggressive as it is only because the paths carry a content digest: a
@@ -48,8 +50,6 @@ type adminNotebookView struct {
 	// cloud-hosted notebook is closed by definition, and saying so on every row of that group would
 	// be a badge that carries no information.
 	Closed bool
-
-	CanPermanentlyDelete bool
 }
 
 type dashboardPageData struct {
@@ -121,6 +121,18 @@ func (application adminApplication) handleAdminScript(w http.ResponseWriter, r *
 	_, _ = w.Write([]byte(adminScript))
 }
 
+// handleIcon serves one of the embedded drawings.
+//
+// One handler for both rather than one each: they differ only in their bytes, and the path a
+// request arrived on is already the whole of the routing decision.
+func (application adminApplication) handleIcon(icon adminIcon) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+		w.Header().Set("Cache-Control", assetCacheControl)
+		_, _ = w.Write(icon.content)
+	}
+}
+
 // The admin assets are served under a path containing a digest of what they hold.
 //
 // A fixed path plus a cache lifetime is a trap for an upgradeable product: the pages are no-store,
@@ -132,6 +144,44 @@ var (
 	adminStylesheetPath = contentAddressedPath("admin", "css", adminStylesheet)
 	adminScriptPath     = contentAddressedPath("admin", "js", adminScript)
 )
+
+// adminIcon is one embedded drawing and the digest-carrying path it is served from.
+type adminIcon struct {
+	Path    string
+	content []byte
+}
+
+// The notebook icons, which are drawings rather than the typographic glyphs the rest of the panel
+// uses. A notebook is the thing this server exists to hold, so the two rows that name one say which
+// kind it is in a picture: `notebookIcon` for a notebook the devices still have, `cloudNotebookIcon`
+// for one only this server does.
+//
+// Served as files and referenced with <img>, not inlined into the markup. A dashboard lists up to
+// 250 notebooks (maxDashboardNotebooks), and inlining would put a full copy of the drawing in the
+// page once per row -- hundreds of kilobytes of identical markup, rebuilt on every load, against
+// one immutably cached request.
+//
+// Being a separate document is also why they carry their own colours instead of inheriting
+// `currentColor`: CSS does not cross into an <img>. That is a fair trade for artwork that is
+// deliberately multi-coloured, and it is why the tile tints below were matched to the drawings
+// rather than the other way round.
+var (
+	notebookIcon      = mustLoadIcon("notebook_regular.svg", "notebook")
+	cloudNotebookIcon = mustLoadIcon("cloud-notebook.svg", "cloud-notebook")
+)
+
+// mustLoadIcon reads one drawing at startup and panics if it is not there.
+//
+// A panic during package initialisation rather than an error at request time: the file is compiled
+// into this binary, so a missing one is a build that should never have been produced, and the only
+// honest moment to say so is before the server claims to be listening.
+func mustLoadIcon(fileName string, servedName string) adminIcon {
+	content, err := assets.Files.ReadFile(fileName)
+	if err != nil {
+		panic("admin icon " + fileName + " is not embedded: " + err.Error())
+	}
+	return adminIcon{Path: contentAddressedPath(servedName, "svg", string(content)), content: content}
+}
 
 func contentAddressedPath(name string, extension string, content string) string {
 	digest := sha256.Sum256([]byte(content))
@@ -291,7 +341,7 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
       <div class="record-list">
         {{range .Notebooks}}
         <article class="record-row">
-          <div class="record-icon" aria-hidden="true">▤</div>
+          <div class="record-icon notebook"><img src="` + notebookIcon.Path + `" alt="" width="16" height="16"></div>
           <div class="record-main">
             <div class="record-title"><strong>{{.Name}}</strong>{{if .Closed}}<span class="record-state">Closed</span>{{end}}</div>
             <p>Last changed {{.UpdatedAt}}</p>
@@ -304,20 +354,21 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
       {{if .CloudNotebooks}}
       <div class="list-divider">
         <h3>On cloud <span class="count-badge">{{.CloudNotebookCount}}</span></h3>
-        <p>This server holds the only copy. The devices keep the sections and pages and download the contents on demand, so deleting one here deletes it from the account.</p>
+        <p>This server holds the only copy. The devices keep the sections and pages and download the contents on demand </p>
       </div>
       <div class="record-list">
         {{range .CloudNotebooks}}
         <article class="record-row">
-          <div class="record-icon cloud" aria-hidden="true">☁</div>
+          <div class="record-icon cloud"><img src="` + cloudNotebookIcon.Path + `" alt="" width="16" height="16"></div>
           <div class="record-main">
             <div class="record-title"><strong>{{.Name}}</strong><span class="record-state">On cloud</span></div>
             <p>Last changed {{.UpdatedAt}}</p>
           </div>
-          <form method="post" action="/admin/notebooks/stop-hosting" class="archive-delete" data-confirm-message="Delete this notebook from the account? This server holds the only copy of its contents, so no device can bring it back afterwards.">
+          <form method="post" action="/admin/notebooks/stop-hosting" class="archive-delete" data-confirm-message="Delete this notebook from the account?
+	This server holds the only copy ">
             <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
             <input type="hidden" name="notebook_id" value="{{.ID}}">
-            <button type="submit" class="button-danger">Stop hosting</button>
+            <button type="submit" class="button-danger">Delete</button>
           </form>
         </article>
         {{end}}
@@ -338,18 +389,17 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
             <div class="record-title"><strong>{{.Name}}</strong><span class="record-state">Archived</span></div>
             <p>Archived {{.UpdatedAt}}</p>
           </div>
-          <form method="post" action="/admin/notebooks/delete" class="archive-delete" data-confirm-message="Permanently delete this archived notebook and all of its contents? This cannot be undone.">
+          <form method="post" action="/admin/notebooks/delete" class="archive-delete" data-confirm-message="Permanently delete this archived notebook and all of its contents? Every device drops its copy the next time it connects. This cannot be undone.">
             <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
             <input type="hidden" name="notebook_id" value="{{.ID}}">
-            <button type="submit" class="button-danger"{{if not .CanPermanentlyDelete}} disabled title="Every active device must sync the deletion first."{{end}}>Permanently delete</button>
-            {{if not .CanPermanentlyDelete}}<small>Waiting for active devices to sync.</small>{{end}}
+            <button type="submit" class="button-danger">Permanently delete</button>
           </form>
         </article>
         {{end}}
       </div>
       {{if .HiddenArchivedCount}}<p class="list-note">{{.HiddenArchivedCount}} more not shown.</p>{{end}}
       {{else}}
-      <div class="empty-state"><span aria-hidden="true">◇</span><h3>No archived notebooks</h3><p>Notebooks deleted by a synced client will be retained here.</p></div>
+      <div class="empty-state"><span aria-hidden="true">◇</span><h3>No archived notebooks</h3><p>Notebooks deleted by a synced client are retained here until you delete them for good.</p></div>
       {{end}}
       </div>
     </section>
@@ -479,7 +529,14 @@ button:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 .list-divider h3 { display: flex; align-items: center; gap: .55rem; margin: 0; font-size: .9rem; letter-spacing: -.02em; }
 .list-divider .count-badge { min-width: 1.6rem; height: 1.6rem; font-size: .7rem; }
 .list-divider p { max-width: 46rem; margin: 0; color: var(--muted); font-size: .76rem; line-height: 1.45; }
-.record-icon.cloud { color: #9aa9ff; background: #9aa9ff10; }
+/* The two notebook tiles hold a drawing rather than a glyph. It is authored at 16px and drawn at
+   1.5rem, which is the size the glyphs in the other tiles optically land at -- a smaller icon in the
+   same 2.5rem tile reads as a different kind of row, and these are the same kind of row.
+   The tints are the drawings' own blue rather than the device tile's green: a green plate behind a
+   blue notebook is the one combination that looks like a mistake instead of a choice. */
+.record-icon img { display: block; width: 1.5rem; height: 1.5rem; }
+.record-icon.notebook { background: #007fff14; }
+.record-icon.cloud { color: #9aa9ff; background: #9aa9ff14; }
 .archive-delete { display: grid; justify-items: end; gap: .35rem; }
 .archive-delete small { color: var(--muted); font-size: .68rem; }
 /* The rename field sizes to its own content rather than taking the shared full-width input rule, so

@@ -37,6 +37,15 @@ const (
 	// one rejection the client can always clear on its own, because it is the one that says the
 	// client has something the server has not been given yet.
 	ReasonMissingBlob = "missing_blob"
+
+	// ReasonPurged means the account erased this id for good and will not store anything under it
+	// again. The client drops the entity and everything beneath it; the same news reaches it as a
+	// `purges` entry on the next pull, and this is only what happens when a push gets there first.
+	//
+	// It is the one rejection that is not about the change: the entity may be perfectly valid and
+	// the version may be right. What is wrong is that the row it edits no longer exists and is not
+	// coming back, so accepting it would hand the account back the notebook it just erased.
+	ReasonPurged = "purged"
 )
 
 // MaxChangesPerBatch caps one push. The client paginates; the body limit in httpapi caps the other

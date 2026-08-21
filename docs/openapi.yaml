@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.6.0
+  version: 0.7.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -33,6 +33,15 @@ info:
     of those. A push that deletes a notebook the server has stored as closed does not store a
     tombstone — it keeps the notebook and marks it `cloudOnlyAt` instead, so the contents stay
     hosted and any device can download them again. See `POST /v1/changes`.
+
+    Ordinary deletion is a tombstone, which is a change like any other. **Permanent deletion is
+    not.** The server owner can erase an already-deleted notebook from the administration panel,
+    which removes its rows outright — there is then no row left to describe it, so `GET /v1/changes`
+    reports it in `purges` instead: a list of ids the account has erased for good, delivered under
+    the same cursor as the changes beside them. A client applies a purge by deleting that entity and
+    everything beneath it, and it is expected to do so without asking; nothing about a purge is
+    negotiable and no device is waited for. A purged id is retired, so a push naming one is rejected
+    `purged` rather than storing the entity again.
 
     Attachment bytes (S5) are addressed by content, at `/v1/blobs/{sha256}`, and are the one part of
     a notebook that does not travel through the change protocol. Upload the bytes first, then push
@@ -326,12 +335,14 @@ paths:
       summary: Read the changes recorded after a cursor
       description: |
         Returns every change with a `seq` greater than `since`, oldest first and parents before
-        children within each `seq`.
+        children within each `seq`, together with every id the account erased for good in the same
+        window.
 
         A response never splits a push. Every entity a push accepted carries one `seq` value and
         arrives in one response, which makes `limit` a request rather than a hard cap: a single push
-        larger than `limit` is still returned whole. Apply the whole response, then store `cursor`,
-        then repeat while `hasMore` is true.
+        larger than `limit` is still returned whole. Apply the whole response — `changes` **and**
+        `purges` — then store `cursor`, then repeat while `hasMore` is true. Both arrays are bounded
+        by the `cursor` the response returns, so storing it is one promise covering both.
 
         The delta includes the calling device's own writes. That is deliberate — it is what lets a
         device whose push response was lost recover the authoritative row by pulling.
@@ -360,8 +371,8 @@ paths:
       responses:
         "200":
           description: |
-            The delta, possibly empty. An empty `changes` with a `cursor` above `since` cannot
-            happen; a client that is ahead of the server receives the server's lower cursor.
+            The delta, possibly empty. An empty `changes` with `hasMore` true cannot happen; a
+            client that is ahead of the server receives the server's lower cursor.
           content:
             application/json:
               schema:
@@ -828,12 +839,25 @@ components:
     PullChangesResponse:
       type: object
       additionalProperties: false
-      required: [changes, cursor, hasMore]
+      required: [changes, purges, cursor, hasMore]
       properties:
         changes:
           type: array
           items:
             $ref: "#/components/schemas/Change"
+        purges:
+          type: array
+          description: |
+            Entities the account erased for good, in the same `(since, cursor]` window as `changes`
+            and usually empty. Delete each one and everything beneath it — a purge names only the
+            root, because the server cascades the subtree away and the client's schema does too.
+
+            A purge is not a change and never appears in `changes`. There is no version to reconcile
+            and no stored row to describe: the entity is gone, the id is retired, and pushing
+            anything under it afterwards is rejected `purged`. Applying one is not optional and the
+            server does not wait to find out whether you did.
+          items:
+            $ref: "#/components/schemas/Purge"
         cursor:
           type: integer
           format: int64
@@ -844,6 +868,31 @@ components:
         hasMore:
           type: boolean
           description: True when more changes exist beyond `cursor`. Pull again immediately.
+
+    Purge:
+      type: object
+      required: [kind, id, seq, purgedAt]
+      properties:
+        kind:
+          $ref: "#/components/schemas/EntityKind"
+        id:
+          type: string
+          description: The erased entity's id. Only `notebook` is erased this way today.
+          example: 0c8f1f1e-6d1a-4a5f-9f3e-2b1c8b6a9d10
+        seq:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            The account sequence value the purge was recorded under, so it can be ordered against
+            the changes in the same response. Never shared with a change.
+        purgedAt:
+          type: integer
+          format: int64
+          description: |
+            Server clock, milliseconds since the epoch. Server truth rather than a client's, because
+            no client wrote this. For display and logs; nothing about applying a purge depends on it.
+          example: 1755300000000
 
     PushChangesRequest:
       type: object
@@ -932,12 +981,18 @@ components:
         `malformed` — the change could not be read as the kind it claims to be, its id is unusable,
         the same entity appeared twice in one batch, an `attachment` declares a `byteCount` that is
         not the size of the blob its id names, or the kind is one this server does not know.
+        `purged` — the account erased this id for good and will not store anything under it again.
+        Delete the entity and everything beneath it, and drop it from the outbox; the same news is
+        in `purges` on the next pull, and this is only what happens when a push gets there first. It
+        is the one rejection that is not about the change: retrying it, re-pushing it with
+        `baseVersion` 0, or sending it as a tombstone are all rejected the same way.
       enum:
         - version_conflict
         - missing_parent
         - missing_blob
         - too_large
         - malformed
+        - purged
 
     EntityKind:
       type: string

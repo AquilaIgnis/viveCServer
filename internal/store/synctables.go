@@ -696,8 +696,8 @@ func RecordAppliedBatchResponse(
 // RecordAcknowledgedSeq stores the highest cursor a device has presented as `since` on a later
 // pull. That is stronger than recording the cursor the server is about to return: a response can be
 // lost after the database update but before the client receives its body. A cursor presented by the
-// client proves it received and committed every change through that sequence, which is what makes
-// permanent tombstone deletion safe.
+// client proves it received and committed every change through that sequence, which is what tells
+// the purge log that a device has been given the news and the row can go (store.PrunePurges).
 //
 // It never moves backwards, so an out-of-order request cannot make a device look staler than it is.
 func RecordAcknowledgedSeq(ctx context.Context, database Querier, deviceID string, cursor int64) error {

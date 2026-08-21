@@ -749,7 +749,7 @@ func TestDashboardShowsClientDeletesInTheArchive(t *testing.T) {
 		accountCount: 1,
 		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
 		archivedNotebooks: []store.NotebookSummary{
-			{ID: "nb-old", Name: `<script>alert("archived")</script>`, ServerUpdatedAt: archivedAt, ReadyForPermanentDeletion: true},
+			{ID: "nb-old", Name: `<script>alert("archived")</script>`, ServerUpdatedAt: archivedAt},
 		},
 		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
 	}
@@ -779,11 +779,13 @@ func TestDashboardShowsClientDeletesInTheArchive(t *testing.T) {
 	if !strings.Contains(body, `action="/admin/notebooks/delete"`) || !strings.Contains(body, `name="notebook_id" value="nb-old"`) {
 		t.Fatal("the archived row has no permanent-delete form for its notebook id")
 	}
-	if !strings.Contains(body, `data-confirm-message="Permanently delete this archived notebook and all of its contents? This cannot be undone."`) {
+	if !strings.Contains(body, `data-confirm-message="Permanently delete this archived notebook and all of its contents? Every device drops its copy the next time it connects. This cannot be undone."`) {
 		t.Fatal("the permanent-delete form does not ask for destructive confirmation")
 	}
+	// No device can hold this back and the markup must not suggest one can: the deletion happens
+	// now and the devices are told about it afterwards.
 	if strings.Contains(body, `class="button-danger" disabled`) {
-		t.Fatal("a notebook acknowledged by every active device still has a disabled delete button")
+		t.Fatal("the archive offered a disabled permanent-delete button")
 	}
 }
 
@@ -795,7 +797,7 @@ func TestPermanentNotebookDeletionRequiresCSRFAndReturnsToTheArchive(t *testing.
 	database := &fakeAdminStore{
 		accountCount:      1,
 		account:           store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
-		archivedNotebooks: []store.NotebookSummary{{ID: "nb-old", Name: "Old field notes", ReadyForPermanentDeletion: true}},
+		archivedNotebooks: []store.NotebookSummary{{ID: "nb-old", Name: "Old field notes"}},
 		sessions:          map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
 	}
 	handler := newAdminTestHandler(database)
@@ -827,7 +829,10 @@ func TestPermanentNotebookDeletionRequiresCSRFAndReturnsToTheArchive(t *testing.
 	}
 }
 
-func TestPermanentNotebookDeletionExplainsADeviceThatHasNotSynced(t *testing.T) {
+// TestPermanentNotebookDeletionRefusesALiveNotebook: the archive's action is housekeeping that
+// follows a deletion, never a second way to perform one. The markup that offered it is stale, and
+// markup is not an authority boundary.
+func TestPermanentNotebookDeletionRefusesALiveNotebook(t *testing.T) {
 	plainToken, tokenHash, err := auth.MintAdminSessionToken()
 	if err != nil {
 		t.Fatal(err)
@@ -836,18 +841,10 @@ func TestPermanentNotebookDeletionExplainsADeviceThatHasNotSynced(t *testing.T) 
 		accountCount:      1,
 		account:           store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
 		archivedNotebooks: []store.NotebookSummary{{ID: "nb-old", Name: "Old field notes"}},
-		deleteNotebookErr: store.ErrNotebookDeletionNotSynced,
+		deleteNotebookErr: store.ErrNotebookNotArchived,
 		sessions:          map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
 	}
 	handler := newAdminTestHandler(database)
-
-	archivePage := httptest.NewRecorder()
-	archiveRequest := httptest.NewRequest(http.MethodGet, "/admin?tab=archived", nil)
-	archiveRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
-	handler.ServeHTTP(archivePage, archiveRequest)
-	if !strings.Contains(archivePage.Body.String(), `class="button-danger" disabled`) || !strings.Contains(archivePage.Body.String(), "Waiting for active devices to sync.") {
-		t.Fatal("the archive did not disable permanent deletion while a device was behind")
-	}
 
 	form := url.Values{"notebook_id": {"nb-old"}, "csrf_token": {adminCSRFToken(plainToken)}}
 	request := httptest.NewRequest(http.MethodPost, "/admin/notebooks/delete", strings.NewReader(form.Encode()))
@@ -856,8 +853,8 @@ func TestPermanentNotebookDeletionExplainsADeviceThatHasNotSynced(t *testing.T) 
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
-	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "Wait for every active device to sync") {
-		t.Fatalf("pending delete = %d %q, want an actionable 409", response.Code, response.Body.String())
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "Only a notebook deleted by a client") {
+		t.Fatalf("deleting a live notebook = %d %q, want an explanatory 409", response.Code, response.Body.String())
 	}
 }
 
@@ -1036,6 +1033,81 @@ func TestAdminAssetsAreContentAddressed(t *testing.T) {
 	}
 	if cacheControl := asset.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "immutable") {
 		t.Fatalf("asset Cache-Control = %q, want an immutable cache now that the path carries a digest", cacheControl)
+	}
+}
+
+// TestNotebookIconsAreServedAndAllowedByTheCSP: the two notebook rows carry drawings rather than
+// glyphs, which means three things have to agree -- the markup, the router, and the policy header.
+// The last one is the trap: `default-src 'none'` covers images, so an <img> added without amending
+// the CSP renders an alt-text stub and a console warning on a page that still passes every other
+// test.
+func TestNotebookIconsAreServedAndAllowedByTheCSP(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		notebooks:    []store.NotebookSummary{{ID: "nb-live", Name: "Work"}},
+		cloudNotebooks: []store.NotebookSummary{
+			{ID: "nb-cloud", Name: "Archive 2019", Closed: true},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	page := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin?tab=notebooks", nil)
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(page, request)
+	body := page.Body.String()
+
+	policy := page.Header().Get("Content-Security-Policy")
+	if !strings.Contains(policy, "img-src 'self'") {
+		t.Fatalf("CSP = %q, which blocks the notebook drawings the page just asked for", policy)
+	}
+	if strings.Contains(policy, "img-src *") || strings.Contains(policy, "img-src 'self' data:") {
+		t.Fatalf("CSP = %q, wider than it needs to be: every image is served from this binary", policy)
+	}
+
+	for _, icon := range []struct {
+		name   string
+		path   string
+		marker string
+	}{
+		{name: "synced notebook", path: notebookIcon.Path, marker: `class="record-icon notebook"`},
+		{name: "cloud notebook", path: cloudNotebookIcon.Path, marker: `class="record-icon cloud"`},
+	} {
+		if !strings.Contains(body, icon.marker+`><img src="`+icon.path+`"`) {
+			t.Fatalf("the %s row does not draw %s", icon.name, icon.path)
+		}
+		if strings.HasSuffix(icon.path, "/assets/notebook.svg") {
+			t.Fatalf("the %s icon is at a fixed path, so a stale cache can outlive an upgrade", icon.name)
+		}
+
+		// Whatever the markup asks for is what the router answers. The two come from one value, and
+		// this is the assertion that keeps them that way.
+		asset := httptest.NewRecorder()
+		handler.ServeHTTP(asset, httptest.NewRequest(http.MethodGet, icon.path, nil))
+		if asset.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200", icon.path, asset.Code)
+		}
+		if contentType := asset.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "image/svg+xml") {
+			t.Fatalf("%s Content-Type = %q, want image/svg+xml", icon.path, contentType)
+		}
+		if !strings.Contains(asset.Body.String(), "<svg") {
+			t.Fatalf("%s did not answer with a drawing", icon.path)
+		}
+		if cacheControl := asset.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "immutable") {
+			t.Fatalf("%s Cache-Control = %q, want an immutable cache now that the path carries a digest", icon.path, cacheControl)
+		}
+	}
+
+	// The two rows must not end up drawing the same picture, which is what a copy-paste in the
+	// template looks like and what nothing else here would catch.
+	if notebookIcon.Path == cloudNotebookIcon.Path {
+		t.Fatal("both notebook rows draw the same icon")
 	}
 }
 

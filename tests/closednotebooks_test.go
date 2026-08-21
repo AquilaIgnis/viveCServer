@@ -282,11 +282,8 @@ func TestStopHostingACloudNotebookDeletesItThroughTheOrdinaryPath(t *testing.T) 
 		t.Fatalf("cloud=%d archived=%d after unhosting, want 0 and 1",
 			overview.CloudNotebookCount, overview.ArchivedNotebookCount)
 	}
-	if !overview.ArchivedNotebooks[0].ReadyForPermanentDeletion {
-		t.Fatal("both devices acknowledged the deletion, so the archive row should be erasable")
-	}
 
-	// And the existing interlocked action finishes the job, subtree and all.
+	// And the archive's own action finishes the job, subtree and all.
 	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-cloud"); err != nil {
 		t.Fatalf("permanently deleting the unhosted notebook: %v", err)
 	}

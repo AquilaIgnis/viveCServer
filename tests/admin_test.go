@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/AquilaIgnis/viveCServer/internal/store"
+	"github.com/AquilaIgnis/viveCServer/internal/syncengine"
 )
 
 // TestRemovingRevokedDevicesLeavesTheNotesAlone is why this test needs a real database rather than
@@ -271,40 +272,10 @@ func TestPermanentlyDeletingAnArchivedNotebookRemovesItsWholeSubtree(t *testing.
 		t.Fatalf("archiving notebook = %+v, want one write at cursor 2", deleted)
 	}
 
-	// The client that pushed the delete knows its request succeeded, but last_pulled_seq records a
-	// cursor only when the device presents it on a later pull. Both devices must actually receive,
-	// commit, and then acknowledge sequence 2 before the tombstone can be discarded.
-	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-delete"); !errors.Is(err, store.ErrNotebookDeletionNotSynced) {
-		t.Fatalf("deleting before devices pulled the tombstone: %v, want ErrNotebookDeletionNotSynced", err)
-	}
-	overview, err := store.NotebookOverview(ctx, fixture.pool, fixture.accountID, 50)
-	if err != nil {
-		t.Fatalf("loading archive readiness: %v", err)
-	}
-	if len(overview.ArchivedNotebooks) != 1 || overview.ArchivedNotebooks[0].ReadyForPermanentDeletion {
-		t.Fatalf("archive before device pulls = %+v, want one disabled row", overview.ArchivedNotebooks)
-	}
-
-	tablet.pull(1, 0)
-	phone.pull(1, 0)
-	// Receiving the response is not yet an acknowledgement from the server's point of view. A
-	// dropped connection can fail after the server prepares a response, so each client proves local
-	// commit by using cursor 2 as `since` on its next ordinary poll.
-	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-delete"); !errors.Is(err, store.ErrNotebookDeletionNotSynced) {
-		t.Fatalf("deleting before devices acknowledged the tombstone: %v, want ErrNotebookDeletionNotSynced", err)
-	}
-	tablet.pull(2, 0)
-	phone.pull(2, 0)
-	overview, err = store.NotebookOverview(ctx, fixture.pool, fixture.accountID, 50)
-	if err != nil {
-		t.Fatalf("loading acknowledged archive: %v", err)
-	}
-	if len(overview.ArchivedNotebooks) != 1 || !overview.ArchivedNotebooks[0].ReadyForPermanentDeletion {
-		t.Fatalf("archive after device pulls = %+v, want one deletable row", overview.ArchivedNotebooks)
-	}
-
+	// Neither device has pulled the tombstone, and neither is asked to. The whole point of the
+	// purge log is that this is the operator's call and no device gets a vote in it.
 	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-delete"); err != nil {
-		t.Fatalf("permanently deleting acknowledged archive: %v", err)
+		t.Fatalf("permanently deleting an archive no device has pulled: %v", err)
 	}
 
 	for _, entity := range []struct {
@@ -338,5 +309,229 @@ func TestPermanentlyDeletingAnArchivedNotebookRemovesItsWholeSubtree(t *testing.
 	}
 	if keptNotebooks != 1 {
 		t.Fatal("permanent deletion removed an unrelated notebook")
+	}
+
+	// The archive tab is empty now, because the row that was projected into it is gone rather than
+	// merely marked. Nothing is waiting on anything.
+	overview, err := store.NotebookOverview(ctx, fixture.pool, fixture.accountID, 50)
+	if err != nil {
+		t.Fatalf("loading the overview after permanent deletion: %v", err)
+	}
+	if len(overview.ArchivedNotebooks) != 0 || overview.ArchivedNotebookCount != 0 {
+		t.Fatalf("archive after permanent deletion = %+v, want nothing", overview.ArchivedNotebooks)
+	}
+
+	// Both devices are still at cursor 1: they never saw the tombstone at 2 and there is no
+	// tombstone left to see. What reaches them instead is the purge, under the cursor the deletion
+	// allocated for it.
+	for _, device := range []*deviceClient{tablet, phone} {
+		delta := device.pull(1, 0)
+		if len(delta.Purges) != 1 {
+			t.Fatalf("%s pulled %d purges, want 1: %s", device.name, len(delta.Purges), delta.Purges)
+		}
+		purge := decodeChangeObject(t, delta.Purges[0])
+		if purge["kind"] != "notebook" || purge["id"] != "notebook-delete" {
+			t.Fatalf("%s pulled purge %+v, want the deleted notebook", device.name, purge)
+		}
+		if purge["seq"] != float64(delta.Cursor) {
+			t.Fatalf("%s pulled purge at seq %v under cursor %d", device.name, purge["seq"], delta.Cursor)
+		}
+		if delta.HasMore {
+			t.Fatalf("%s has more after the purge", device.name)
+		}
+		// The tombstone is not among the changes: there is no row left to render one from. The
+		// purge is the entire notification, which is why it has to be its own array rather than
+		// something a client could mistake for an ordinary delete.
+		for _, raw := range delta.Changes {
+			if decodeChangeObject(t, raw)["id"] == "notebook-delete" {
+				t.Fatalf("%s pulled a change for a permanently deleted notebook: %s", device.name, raw)
+			}
+		}
+	}
+}
+
+// TestAPurgedNotebookCannotBePushedBackByADeviceThatMissedIt: the gravestone half of the log. A
+// device that was offline when the operator erased a notebook still holds it, and the client's
+// answer to "this account has no such entity" is to push it again as new — which would hand the
+// account back exactly what it deleted, from the one device that had not heard.
+func TestAPurgedNotebookCannotBePushedBackByADeviceThatMissedIt(t *testing.T) {
+	fixture := newSyncFixture(t)
+	ctx := context.Background()
+
+	tablet := fixture.registerDevice("Studio tablet")
+	tablet.push(
+		notebookChange("notebook-gone", 0, "Field notes"),
+		sectionChange("section-gone", 0, "notebook-gone", "Ideas"),
+	)
+	tablet.push(deletedNotebookChange(notebookChange("notebook-gone", 1, "Field notes"), 1_700_000_001_000))
+
+	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-gone"); err != nil {
+		t.Fatalf("permanently deleting the archive: %v", err)
+	}
+
+	// The stale edit the device had queued. Its baseVersion is the version it last saw.
+	stale := tablet.push(notebookChange("notebook-gone", 2, "Field notes"))
+	if len(stale.Applied) != 0 || len(stale.Rejected) != 1 {
+		t.Fatalf("pushing a purged notebook = %+v, want one rejection", stale)
+	}
+	if stale.Rejected[0].Reason != syncengine.ReasonPurged {
+		t.Fatalf("pushing a purged notebook was refused %q, want %q", stale.Rejected[0].Reason, syncengine.ReasonPurged)
+	}
+
+	// And again as new, which is what a client does when it is told the server has no such entity.
+	// This is the push the log actually exists to stop.
+	asNew := tablet.push(notebookChange("notebook-gone", 0, "Field notes"))
+	if len(asNew.Applied) != 0 || len(asNew.Rejected) != 1 || asNew.Rejected[0].Reason != syncengine.ReasonPurged {
+		t.Fatalf("re-creating a purged notebook = %+v, want one purged rejection", asNew)
+	}
+
+	// A tombstone for it is refused for the same reason: there is nothing left to tombstone, and
+	// storing one would put a row back into the archive the operator has already emptied.
+	asTombstone := tablet.push(deletedNotebookChange(notebookChange("notebook-gone", 0, "Field notes"), 1_700_000_002_000))
+	if len(asTombstone.Rejected) != 1 || asTombstone.Rejected[0].Reason != syncengine.ReasonPurged {
+		t.Fatalf("tombstoning a purged notebook = %+v, want one purged rejection", asTombstone)
+	}
+
+	var notebookRows int64
+	if err := fixture.pool.QueryRow(ctx,
+		`SELECT count(*) FROM notebooks WHERE account_id = $1::uuid AND id = 'notebook-gone'`,
+		fixture.accountID,
+	).Scan(&notebookRows); err != nil {
+		t.Fatalf("counting the purged notebook: %v", err)
+	}
+	if notebookRows != 0 {
+		t.Fatal("a purged notebook came back")
+	}
+
+	// A different notebook in the same batch is unaffected: the refusal is about one retired id,
+	// not about the push.
+	mixed := tablet.push(
+		notebookChange("notebook-gone", 0, "Field notes"),
+		notebookChange("notebook-fresh", 0, "New field notes"),
+	)
+	if len(mixed.Applied) != 1 || mixed.Applied[0].ID != "notebook-fresh" {
+		t.Fatalf("a batch beside a purged id = %+v, want the fresh notebook applied", mixed)
+	}
+	if len(mixed.Rejected) != 1 || mixed.Rejected[0].ID != "notebook-gone" {
+		t.Fatalf("a batch beside a purged id = %+v, want only the purged id refused", mixed)
+	}
+}
+
+// TestPurgesAreScopedToOneAccountAndDrainOnce: the log is account-keyed like everything else, and a
+// device that has already been told does not keep being told.
+func TestPurgesAreScopedToOneAccountAndDrainOnce(t *testing.T) {
+	fixture := newSyncFixture(t)
+	stranger := newSyncFixtureOnStore(t, fixture)
+	ctx := context.Background()
+
+	tablet := fixture.registerDevice("Studio tablet")
+	tablet.push(notebookChange("notebook-gone", 0, "Field notes"))
+	tablet.push(deletedNotebookChange(notebookChange("notebook-gone", 1, "Field notes"), 1_700_000_001_000))
+
+	strangerTablet := stranger.registerDevice("Someone else's tablet")
+	strangerTablet.push(notebookChange("notebook-gone", 0, "Same id, other account"))
+
+	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-gone"); err != nil {
+		t.Fatalf("permanently deleting the archive: %v", err)
+	}
+
+	// The other account shares the id and hears nothing, and its own notebook is untouched.
+	strangerDelta := strangerTablet.pull(0, 0)
+	if len(strangerDelta.Purges) != 0 {
+		t.Fatalf("another account pulled %d purges, want 0: %s", len(strangerDelta.Purges), strangerDelta.Purges)
+	}
+	if len(strangerDelta.Changes) != 1 {
+		t.Fatalf("another account's notebook = %+v, want it intact", strangerDelta.Changes)
+	}
+
+	purgeSeq := tablet.pull(0, 0)
+	if len(purgeSeq.Purges) != 1 {
+		t.Fatalf("first pull carried %d purges, want 1", len(purgeSeq.Purges))
+	}
+	// Read at the cursor it was delivered under: the window is half-open, so a client that stored
+	// the cursor does not receive it a second time.
+	drained := tablet.pull(purgeSeq.Cursor, 0)
+	if len(drained.Purges) != 0 {
+		t.Fatalf("a second pull repeated %d purges: %s", len(drained.Purges), drained.Purges)
+	}
+}
+
+// TestAPurgeIsPrunedOnceEveryActiveDeviceHasAcknowledgedIt: the interlock that used to block the
+// operator now decides only how long a hundred bytes of log are worth keeping.
+func TestAPurgeIsPrunedOnceEveryActiveDeviceHasAcknowledgedIt(t *testing.T) {
+	fixture := newSyncFixture(t)
+	ctx := context.Background()
+
+	tablet := fixture.registerDevice("Studio tablet")
+	phone := fixture.registerDevice("Phone")
+	tablet.push(notebookChange("notebook-first", 0, "Field notes"))
+	tablet.push(deletedNotebookChange(notebookChange("notebook-first", 1, "Field notes"), 1_700_000_001_000))
+	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-first"); err != nil {
+		t.Fatalf("permanently deleting the first archive: %v", err)
+	}
+
+	// The tablet drains the purge and acknowledges it by presenting the cursor on a later pull. The
+	// phone has not been switched on since, so the log has to stay.
+	firstPurgeCursor := tablet.pull(0, 0).Cursor
+	tablet.pull(firstPurgeCursor, 0)
+
+	tablet.push(notebookChange("notebook-second", 0, "Other notes"))
+	tablet.push(deletedNotebookChange(notebookChange("notebook-second", 1, "Other notes"), 1_700_000_002_000))
+	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-second"); err != nil {
+		t.Fatalf("permanently deleting the second archive: %v", err)
+	}
+	if held := fixture.purgedIDs(); len(held) != 2 {
+		t.Fatalf("purge log holds %v, want both notebooks while a device is behind", held)
+	}
+
+	// The phone catches up and acknowledges. The next permanent deletion is what sweeps the log,
+	// which is why the count is read after one rather than by a background job nobody scheduled.
+	phoneCursor := phone.pull(0, 0).Cursor
+	phone.pull(phoneCursor, 0)
+	tablet.pull(phoneCursor, 0)
+
+	tablet.push(notebookChange("notebook-third", 0, "Third notes"))
+	tablet.push(deletedNotebookChange(notebookChange("notebook-third", 1, "Third notes"), 1_700_000_003_000))
+	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-third"); err != nil {
+		t.Fatalf("permanently deleting the third archive: %v", err)
+	}
+	held := fixture.purgedIDs()
+	if len(held) != 1 || held[0] != "notebook-third" {
+		t.Fatalf("purge log holds %v, want only the deletion nobody has acknowledged yet", held)
+	}
+}
+
+// TestARevokedDeviceDoesNotHoldThePurgeLogOpen: revocation is permanent, so a revoked device can
+// neither pull the purge nor push the id back, and nothing is waiting for it.
+func TestARevokedDeviceDoesNotHoldThePurgeLogOpen(t *testing.T) {
+	fixture := newSyncFixture(t)
+	ctx := context.Background()
+
+	tablet := fixture.registerDevice("Studio tablet")
+	lost := fixture.registerDevice("Lost tablet")
+	tablet.push(notebookChange("notebook-first", 0, "Field notes"))
+	tablet.push(deletedNotebookChange(notebookChange("notebook-first", 1, "Field notes"), 1_700_000_001_000))
+	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-first"); err != nil {
+		t.Fatalf("permanently deleting the first archive: %v", err)
+	}
+
+	if _, err := fixture.pool.Exec(ctx,
+		`UPDATE devices SET revoked_at = now() WHERE id = $1::uuid`, lost.deviceID,
+	); err != nil {
+		t.Fatalf("revoking the lost device: %v", err)
+	}
+
+	firstPurgeCursor := tablet.pull(0, 0).Cursor
+	tablet.pull(firstPurgeCursor, 0)
+
+	tablet.push(notebookChange("notebook-second", 0, "Other notes"))
+	tablet.push(deletedNotebookChange(notebookChange("notebook-second", 1, "Other notes"), 1_700_000_002_000))
+	if err := store.DeleteArchivedNotebook(ctx, fixture.pool, fixture.accountID, "notebook-second"); err != nil {
+		t.Fatalf("permanently deleting the second archive: %v", err)
+	}
+
+	held := fixture.purgedIDs()
+	if len(held) != 1 || held[0] != "notebook-second" {
+		t.Fatalf("purge log holds %v; a revoked device held it open", held)
 	}
 }

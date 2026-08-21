@@ -601,6 +601,37 @@ func (fixture *syncFixture) notebookShelf(notebookID string) (closedAt *int64, c
 	return closedAt, cloudOnlyAt, deletedAt
 }
 
+// purgedIDs is what the account's purge log still holds, oldest first.
+//
+// Read from the table rather than from a pull, because the point of pruning is what the server
+// stopped keeping rather than what it last answered: a purge nobody is waiting for and a purge that
+// has already been delivered look identical from the client side.
+func (fixture *syncFixture) purgedIDs() []string {
+	fixture.t.Helper()
+
+	rows, err := fixture.pool.Query(context.Background(),
+		`SELECT entity_id FROM purges WHERE account_id = $1::uuid ORDER BY change_seq`,
+		fixture.accountID,
+	)
+	if err != nil {
+		fixture.t.Fatalf("reading the purge log: %v", err)
+	}
+	defer rows.Close()
+
+	held := make([]string, 0)
+	for rows.Next() {
+		var entityID string
+		if err := rows.Scan(&entityID); err != nil {
+			fixture.t.Fatalf("reading the purge log: %v", err)
+		}
+		held = append(held, entityID)
+	}
+	if err := rows.Err(); err != nil {
+		fixture.t.Fatalf("reading the purge log: %v", err)
+	}
+	return held
+}
+
 // notebookExtra is what the server kept of a notebook change it did not recognise.
 func (fixture *syncFixture) notebookExtra(notebookID string) string {
 	fixture.t.Helper()

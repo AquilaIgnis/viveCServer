@@ -42,8 +42,25 @@ type PushResult struct {
 // PullResult is what a delta request answers.
 type PullResult struct {
 	Changes []json.RawMessage `json:"changes"`
-	Cursor  int64             `json:"cursor"`
-	HasMore bool              `json:"hasMore"`
+
+	// Purges are the entities this account erased for good inside the same window as Changes: ids
+	// with nothing left to describe them, which a client deletes locally along with everything
+	// beneath them. Always present, usually empty.
+	//
+	// A second array rather than more entries in Changes. A purge is not a change and could not
+	// pretend to be one — no version, no baseVersion, no parent, no push path — so a ninth
+	// store.SyncKind would be a fake table and four interface methods answering nothing.
+	//
+	// It is also the shape that survives the server and the app being deployed separately. A client
+	// that does not know this field ignores it and keeps a notebook it should have dropped, which is
+	// untidy; a client that met an unrecognised `kind` inside Changes would stop synchronising
+	// altogether rather than advance a cursor past a row it could not store, which is the right
+	// thing for it to do and the wrong thing to provoke every time this container restarts ahead of
+	// the tablets.
+	Purges []json.RawMessage `json:"purges"`
+
+	Cursor  int64 `json:"cursor"`
+	HasMore bool  `json:"hasMore"`
 }
 
 // ApplyChangeBatch stores what it can of a push and reports what it refused.
@@ -156,6 +173,22 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 						continue
 					}
 				}
+			}
+
+			// An id the account erased for good. Refused before the version check, because the
+			// version check has nothing useful to say about it: the row is gone, so a stale
+			// baseVersion is a conflict with no current state to send back, and the client's answer
+			// to that is to re-push at baseVersion 0 — which would create the notebook again. The
+			// device that was offline when the operator pressed Permanently delete would then be the
+			// one device able to undo it. See store.SelectPurgedIDs.
+			if _, retired := batchContext.purgedIDs[change.envelope.ID]; retired {
+				rejected = append(rejected, RejectedChange{
+					Kind:    kind.Name,
+					ID:      change.envelope.ID,
+					Reason:  ReasonPurged,
+					Message: "this account permanently deleted this entity; delete your copy of it",
+				})
+				continue
 			}
 
 			current, storedHere := batchContext.currentByID[change.envelope.ID]
@@ -273,11 +306,15 @@ type batchContext struct {
 	// storedBlobs is which of the attachment digests the run references are held by this account,
 	// and how large each one is.
 	storedBlobs map[string]store.BlobPresence
+
+	// purgedIDs is which of the run's own ids this account has erased for good and will never
+	// store anything under again.
+	purgedIDs map[string]struct{}
 }
 
-// readBatchContext fetches all of that in at most three queries.
+// readBatchContext fetches all of that in at most four queries.
 //
-// Three rather than three per entity: a push carries up to 512 changes, and a round trip each would
+// Four rather than four per entity: a push carries up to 512 changes, and a round trip each would
 // make the checks cost more than the writes they guard. Each query takes the run's ids as an array.
 func readBatchContext(
 	ctx context.Context,
@@ -334,7 +371,20 @@ func readBatchContext(
 		return batchContext{}, err
 	}
 
-	return batchContext{currentByID: currentByID, parentIDs: existingParentIDs, storedBlobs: storedBlobs}, nil
+	// Asked for every kind rather than only for the one kind permanent deletion writes today. The
+	// log names a kind for exactly this reason, and a check that knew which kinds could appear in it
+	// would be a second copy of that answer, kept level by hand.
+	purgedIDs, err := store.SelectPurgedIDs(ctx, database, accountID, kind.Name, entityIDs)
+	if err != nil {
+		return batchContext{}, err
+	}
+
+	return batchContext{
+		currentByID: currentByID,
+		parentIDs:   existingParentIDs,
+		storedBlobs: storedBlobs,
+		purgedIDs:   purgedIDs,
+	}, nil
 }
 
 // missingDigests reports which of an entity's required blobs this account does not hold.
@@ -367,13 +417,44 @@ func describeMissingBlobs(missing []string) string {
 	return "upload these attachments before pushing this change: " + strings.Join(listed, ", ") + suffix
 }
 
-// PullChanges returns the changes an account accumulated after a client's cursor.
+// PullChanges returns the changes an account accumulated after a client's cursor, together with
+// the ids it erased for good in the same window.
+//
+// Both halves are bounded by the cursor this response returns, not by the account's current one, so
+// "store the cursor once everything above it has been applied" stays a single promise. A page that
+// stopped short leaves the rest of the purges to the pull that follows it, and a purge committed
+// between the two reads takes a sequence value above the bound and is picked up next time — the
+// same argument [selectChangePage] makes for reading the cursor before the delta.
+func PullChanges(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	accountID string,
+	sinceCursor int64,
+	limit int,
+) (PullResult, error) {
+	result, err := selectChangePage(ctx, pool, accountID, sinceCursor, limit)
+	if err != nil {
+		return PullResult{}, err
+	}
+
+	purges, err := store.SelectPurges(ctx, pool, accountID, sinceCursor, result.Cursor)
+	if err != nil {
+		return PullResult{}, err
+	}
+	result.Purges = make([]json.RawMessage, 0, len(purges))
+	for _, purge := range purges {
+		result.Purges = append(result.Purges, purge.Purge)
+	}
+	return result, nil
+}
+
+// selectChangePage is the delta half of a pull: everything but the purges.
 //
 // The cursor is read first and the delta is then bounded by it. Doing it the other way round would
 // let a push commit between the two reads, and the cursor returned would sit above rows the client
 // never received — which is the same lost-update the advisory lock exists to prevent, reintroduced
 // on the read side.
-func PullChanges(
+func selectChangePage(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	accountID string,

@@ -58,7 +58,8 @@ func handleReadCursor(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc 
 	}
 }
 
-// handlePullChanges returns the changes an account accumulated after the client's cursor.
+// handlePullChanges returns the changes an account accumulated after the client's cursor, and the
+// ids it erased for good in the same window.
 func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		caller, ok := authenticatedDeviceOrFail(w, r, logger)
@@ -85,8 +86,9 @@ func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 
 		// `since` is the cursor the client presented, so it is proof that an earlier response was
 		// received and committed locally. The cursor in this response is not proof yet: recording it
-		// before writing the body would let a dropped connection acknowledge a tombstone the client
-		// never saw. This acknowledgement is housekeeping and never allowed to fail the pull.
+		// before writing the body would let a dropped connection acknowledge a purge the client
+		// never saw. This is what decides when a purge stops being worth keeping
+		// (store.PrunePurges); it is housekeeping and never allowed to fail the pull.
 		if err := store.RecordAcknowledgedSeq(r.Context(), pool, caller.DeviceID, sinceCursor); err != nil {
 			logger.Warn("could not record a device acknowledged cursor",
 				"account_id", caller.AccountID, "device_id", caller.DeviceID, "error", err)
@@ -97,6 +99,7 @@ func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 			"device_id", caller.DeviceID,
 			"since", sinceCursor,
 			"returned", len(result.Changes),
+			"purged", len(result.Purges),
 			"cursor", result.Cursor,
 			"has_more", result.HasMore,
 		)
