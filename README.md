@@ -10,7 +10,33 @@ payloads, and everything that needs the document model runs on the client.
 
 Use docs/docker-compose.yml and env sample
 
-`docker compose up -d`
+- you can use this command for `VIVE_POSTGRES_PASSWORD`
+
+```bash
+openssl rand -hex 26
+```
+
+Once ready use :
+
+```
+docker compose up -d
+```
+
+> [!IMPORTANT] You have to correct blob directory ownership if it shares parent with the DB
+
+For example:
+
+```bash
+ sudo chown -R 1000:1000 ./data/blobs
+```
+
+## I lost my password 😱
+
+You will be prompted to enter a new one
+
+```bash
+docker compose exec vivecserver /usr/local/bin/vivecserver set-password -email you@example.com
+```
 
 # Dev
 

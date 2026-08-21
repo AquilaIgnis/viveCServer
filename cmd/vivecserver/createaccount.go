@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 
+	"golang.org/x/term"
+
 	"github.com/AquilaIgnis/viveCServer/internal/auth"
 	"github.com/AquilaIgnis/viveCServer/internal/config"
 	"github.com/AquilaIgnis/viveCServer/internal/store"
@@ -35,7 +37,8 @@ func runCreateAccount(arguments []string) error {
 	emailFlag := flags.String("email", "", "email address for the new account (required)")
 	flags.Usage = func() {
 		fmt.Fprintf(flags.Output(), "usage: vivecserver create-account -email <address>\n\n")
-		fmt.Fprintf(flags.Output(), "The password is read from stdin, or from %s.\n\n", passwordEnvironmentVariable)
+		fmt.Fprintf(flags.Output(), "On a terminal the password is prompted for, twice and hidden.\n")
+		fmt.Fprintf(flags.Output(), "Otherwise it is read from stdin, or from %s.\n\n", passwordEnvironmentVariable)
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(arguments); err != nil {
@@ -47,7 +50,7 @@ func runCreateAccount(arguments []string) error {
 		return errors.New("-email is required")
 	}
 
-	password, err := readPassword(os.Stdin)
+	password, err := readPassword("New password for " + *emailFlag + ": ")
 	if err != nil {
 		return err
 	}
@@ -103,16 +106,69 @@ func runCreateAccount(arguments []string) error {
 	return nil
 }
 
-// readPassword takes the password from the environment if it is set there, and otherwise from the
-// first line of stdin.
-func readPassword(input io.Reader) (string, error) {
+// readPassword takes the password from the environment if it is set there, from a hidden prompt
+// when someone is sitting at a terminal, and otherwise from the first line of stdin.
+//
+// Three sources rather than one because the two ways of running this are genuinely different. An
+// unattended run pipes a password in and must never block on a prompt nobody is there to answer; a
+// person recovering a locked-out server types one, and typing it onto a visible line puts it in the
+// scrollback, in the terminal's own buffer, and often in a shell history file. Which of the two is
+// happening is not a flag to be passed and got wrong -- it is whether stdin is a terminal.
+func readPassword(prompt string) (string, error) {
 	if fromEnvironment := os.Getenv(passwordEnvironmentVariable); fromEnvironment != "" {
 		return fromEnvironment, nil
 	}
 
-	// No terminal echo suppression: that needs golang.org/x/term, and every documented way of
-	// running this pipes stdin rather than typing into a TTY. Worth revisiting if anyone actually
-	// runs it interactively.
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return promptForPassword(prompt)
+	}
+	return readPasswordLine(os.Stdin)
+}
+
+// promptForPassword asks twice with the echo off, and refuses two answers that disagree.
+//
+// Confirming is not ceremony here. The typing is invisible, and both commands this serves end in a
+// credential nothing else can check for you: get it wrong in `create-account` and the account you
+// just made cannot be signed into, get it wrong in `set-password` and you have replaced a password
+// you forgot with one you never knew. The setup wizard asks twice for the same reason.
+//
+// Prompts go to stderr so that `set-password ... > somewhere` still shows them, and so the line the
+// command actually reports stays the only thing on stdout.
+func promptForPassword(prompt string) (string, error) {
+	first, err := readHiddenLine(prompt)
+	if err != nil {
+		return "", err
+	}
+	if first == "" {
+		return "", errors.New("no password entered")
+	}
+
+	second, err := readHiddenLine("Confirm password: ")
+	if err != nil {
+		return "", err
+	}
+	if first != second {
+		return "", errors.New("the two entries do not match")
+	}
+	return first, nil
+}
+
+// readHiddenLine writes one prompt and reads one line without echoing it.
+//
+// The trailing newline is written by hand: the terminal did not echo the one that was typed, so
+// without this every prompt after the first would start on the line the password was not shown on.
+func readHiddenLine(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	typed, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", fmt.Errorf("reading the password from the terminal: %w", err)
+	}
+	return string(typed), nil
+}
+
+// readPasswordLine takes the first line of a pipe, which is the unattended path.
+func readPasswordLine(input io.Reader) (string, error) {
 	reader := bufio.NewReader(input)
 	line, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -121,7 +177,7 @@ func readPassword(input io.Reader) (string, error) {
 
 	password := strings.TrimRight(line, "\r\n")
 	if password == "" {
-		return "", fmt.Errorf("no password supplied: pipe one into stdin or set %s", passwordEnvironmentVariable)
+		return "", fmt.Errorf("no password supplied: pipe one into stdin, run this on a terminal to be prompted, or set %s", passwordEnvironmentVariable)
 	}
 	return password, nil
 }

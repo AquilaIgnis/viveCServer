@@ -66,3 +66,21 @@ func DeleteAdminSession(ctx context.Context, pool *pgxpool.Pool, tokenHash []byt
 	}
 	return nil
 }
+
+// DeleteAdminSessionsForAccount signs every browser out of one account and reports how many it
+// closed.
+//
+// This is what makes a password change a password change. A browser session is a bearer token in
+// its own right — it is checked against `admin_sessions`, never against the password — so a reset
+// that left the old sessions alive would leave whoever was already signed in still signed in, which
+// is precisely the person a reset performed after a laptop went missing is meant to remove. The
+// owner signs in again with the new password; that is the whole cost.
+func DeleteAdminSessionsForAccount(ctx context.Context, pool *pgxpool.Pool, accountID string) (int64, error) {
+	const statement = `DELETE FROM admin_sessions WHERE account_id = $1::uuid`
+
+	result, err := pool.Exec(ctx, statement, accountID)
+	if err != nil {
+		return 0, fmt.Errorf("deleting the admin sessions of an account: %w", err)
+	}
+	return result.RowsAffected(), nil
+}

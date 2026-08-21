@@ -18,7 +18,7 @@ services:
     volumes:
       - ./data/postgres:/var/lib/postgresql
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -34,12 +34,12 @@ services:
       VIVE_BLOB_SWEEP_INTERVAL: ${VIVE_BLOB_SWEEP_INTERVAL}
       VIVE_BLOB_RETENTION: ${VIVE_BLOB_RETENTION}
     volumes:
-      # have to run this sudo because docker if fucking retarded
+      # have to run this because docker if fucking retarded
       # sudo chown -R 1000:1000 ./data/blobs
       - ./data/blobs:/var/lib/vivecserver/blobs
     ports:
-      - '8080:8080' # admin panel
-      - '5444:8281' # sync port
+      - "8080:8080" # admin panel
+      - "5444:8281" # sync port
     depends_on:
       postgres:
         condition: service_healthy

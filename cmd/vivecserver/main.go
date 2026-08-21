@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,15 +28,34 @@ import (
 )
 
 func main() {
-	// One recovery/automation subcommand, dispatched by hand rather than through a CLI framework.
-	// The ordinary first account comes from browser setup; anything more elaborate here would be
-	// machinery for a single fallback verb.
-	if len(os.Args) > 1 && os.Args[1] == "create-account" {
-		if err := runCreateAccount(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "create-account:", err)
-			os.Exit(1)
+	// The recovery and automation subcommands, dispatched by hand rather than through a CLI
+	// framework. The ordinary first account comes from browser setup; these are what an operator
+	// with a shell on the box has when the browser cannot help — which for `set-password` is the
+	// only thing they have, since the setup wizard closes for good once an account exists.
+	//
+	// A map rather than a chain of ifs so that `vivecserver help` can list them, and so adding a
+	// third verb is a line rather than a decision about where to put it.
+	subcommands := map[string]func([]string) error{
+		"create-account": runCreateAccount,
+		"set-password":   runSetPassword,
+	}
+	if len(os.Args) > 1 {
+		if run, known := subcommands[os.Args[1]]; known {
+			if err := run(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, os.Args[1]+":", err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
+		// An unrecognised first argument used to start the server and ignore it, so a typo in a
+		// recovery command looked like a server that would not stop. Only flag-shaped arguments
+		// reach the server, and it takes none, so anything else is a mistake worth naming.
+		if !strings.HasPrefix(os.Args[1], "-") {
+			fmt.Fprintf(os.Stderr, "vivecserver: unknown command %q\n", os.Args[1])
+			fmt.Fprintln(os.Stderr, "commands: create-account, set-password")
+			fmt.Fprintln(os.Stderr, "with no command, the server runs and is configured from the environment")
+			os.Exit(2)
+		}
 	}
 
 	if err := run(); err != nil {
