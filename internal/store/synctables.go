@@ -97,6 +97,19 @@ type BlobConsistencyChecker interface {
 	CheckBlobPresence(entityID string, present map[string]BlobPresence) error
 }
 
+// DeletionRetainer is implemented by a kind for which a client's tombstone can mean "stop holding
+// this on my device" rather than "erase this from the account".
+//
+// Optional, and today only `notebook` implements it. Every other kind's delete is a delete: an
+// inked stroke that a client rubbed out is gone, and a server that second-guessed that would be
+// storing a document its own protocol says does not exist.
+type DeletionRetainer interface {
+	// RetainOnDelete reports whether the tombstone should be stored as a retention instead, and
+	// mutates the fields into the state to store when it is. `stored` is the row as a pull would
+	// render it, or empty when the account holds none.
+	RetainOnDelete(stored json.RawMessage, deletedAt int64) bool
+}
+
 // auxiliaryStatement is a write a kind makes outside its own table.
 type auxiliaryStatement struct {
 	sql       string

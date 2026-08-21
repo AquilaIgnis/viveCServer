@@ -191,6 +191,20 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 			envelope.LastWriter = request.Caller.DeviceID
 			envelope.Version = change.baseVersion + 1
 
+			// A tombstone a kind would rather keep. Only `notebook` implements this, and only for a
+			// notebook that is closed: the delete stops being an erasure and becomes the account
+			// saying no device holds this any more (store.NotebookFields.RetainOnDelete). The
+			// entity still counts as applied and still gets a version, because the write happened —
+			// what the client asked for and what was stored simply differ, and the next pull is
+			// where the client learns that, exactly as it would for any row another device moved.
+			if envelope.DeletedAt != nil {
+				if retainer, retainable := change.fields.(store.DeletionRetainer); retainable {
+					if retainer.RetainOnDelete(current.Change, *envelope.DeletedAt) {
+						envelope.DeletedAt = nil
+					}
+				}
+			}
+
 			pendingWrites = append(pendingWrites, store.PendingWrite{
 				Kind:        kind.Name,
 				Envelope:    envelope,

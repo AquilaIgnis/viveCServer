@@ -37,12 +37,18 @@ type adminDeviceView struct {
 }
 
 // adminNotebookView is one notebook on the dashboard. The client-generated opaque id is never
-// displayed, but an archived row submits it back when the operator permanently deletes that exact
-// notebook. The timestamp is what tells two notebooks with the same name apart on screen.
+// displayed, but a row submits it back when the operator acts on that exact notebook. The timestamp
+// is what tells two notebooks with the same name apart on screen.
 type adminNotebookView struct {
-	ID                   string
-	Name                 string
-	UpdatedAt            string
+	ID        string
+	Name      string
+	UpdatedAt string
+
+	// Closed is whether the notebook is off the app's rail. Only ever shown on the synced list: a
+	// cloud-hosted notebook is closed by definition, and saying so on every row of that group would
+	// be a badge that carries no information.
+	Closed bool
+
 	CanPermanentlyDelete bool
 }
 
@@ -57,6 +63,10 @@ type dashboardPageData struct {
 	NotebookCount         int64
 	Notebooks             []adminNotebookView
 	HiddenNotebookCount   int64
+	CloudNotebookCount    int64
+	CloudNotebooks        []adminNotebookView
+	HiddenCloudCount      int64
+	TabNotebookCount      int64
 	ArchivedNotebookCount int64
 	ArchivedNotebooks     []adminNotebookView
 	HiddenArchivedCount   int64
@@ -220,7 +230,7 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
              ?tab= and renders the same page with the other panel showing. -->
         <nav class="tab-strip" data-tab-strip aria-label="Server contents">
           <a class="tab{{if eq .SelectedTab "devices"}} is-selected{{end}}" href="/admin?tab=devices" data-tab="devices"{{if eq .SelectedTab "devices"}} aria-current="page"{{end}}>Devices <span class="count-badge">{{.DeviceCount}}</span></a>
-          <a class="tab{{if eq .SelectedTab "notebooks"}} is-selected{{end}}" href="/admin?tab=notebooks" data-tab="notebooks"{{if eq .SelectedTab "notebooks"}} aria-current="page"{{end}}>Notebooks <span class="count-badge">{{.NotebookCount}}</span></a>
+          <a class="tab{{if eq .SelectedTab "notebooks"}} is-selected{{end}}" href="/admin?tab=notebooks" data-tab="notebooks"{{if eq .SelectedTab "notebooks"}} aria-current="page"{{end}}>Notebooks <span class="count-badge">{{.TabNotebookCount}}</span></a>
           <a class="tab{{if eq .SelectedTab "archived"}} is-selected{{end}}" href="/admin?tab=archived" data-tab="archived"{{if eq .SelectedTab "archived"}} aria-current="page"{{end}}>Archived <span class="count-badge">{{.ArchivedNotebookCount}}</span></a>
         </nav>
         <div class="panel-actions" data-panel="devices"{{if ne .SelectedTab "devices"}} hidden{{end}}>
@@ -268,19 +278,52 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
       {{end}}
       </div>
       <div data-panel="notebooks"{{if ne .SelectedTab "notebooks"}} hidden{{end}}>
+      {{if or .Notebooks .CloudNotebooks}}
+      <!-- Two groups under one tab, divided by where the contents are rather than by what they are.
+           A heading appears only for a group that has something in it: with nothing on the cloud
+           there is nothing to divide, and a lone "Synced" label above every list would be a
+           distinction the operator cannot act on. -->
       {{if .Notebooks}}
+      <div class="list-divider">
+        <h3>Synced <span class="count-badge">{{.NotebookCount}}</span></h3>
+        <p>Held here and on the devices.</p>
+      </div>
       <div class="record-list">
         {{range .Notebooks}}
         <article class="record-row">
           <div class="record-icon" aria-hidden="true">▤</div>
           <div class="record-main">
-            <div class="record-title"><strong>{{.Name}}</strong></div>
+            <div class="record-title"><strong>{{.Name}}</strong>{{if .Closed}}<span class="record-state">Closed</span>{{end}}</div>
             <p>Last changed {{.UpdatedAt}}</p>
           </div>
         </article>
         {{end}}
       </div>
       {{if .HiddenNotebookCount}}<p class="list-note">{{.HiddenNotebookCount}} more not shown.</p>{{end}}
+      {{end}}
+      {{if .CloudNotebooks}}
+      <div class="list-divider">
+        <h3>On cloud <span class="count-badge">{{.CloudNotebookCount}}</span></h3>
+        <p>This server holds the only copy. The devices keep the sections and pages and download the contents on demand, so deleting one here deletes it from the account.</p>
+      </div>
+      <div class="record-list">
+        {{range .CloudNotebooks}}
+        <article class="record-row">
+          <div class="record-icon cloud" aria-hidden="true">☁</div>
+          <div class="record-main">
+            <div class="record-title"><strong>{{.Name}}</strong><span class="record-state">On cloud</span></div>
+            <p>Last changed {{.UpdatedAt}}</p>
+          </div>
+          <form method="post" action="/admin/notebooks/stop-hosting" class="archive-delete" data-confirm-message="Delete this notebook from the account? This server holds the only copy of its contents, so no device can bring it back afterwards.">
+            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+            <input type="hidden" name="notebook_id" value="{{.ID}}">
+            <button type="submit" class="button-danger">Stop hosting</button>
+          </form>
+        </article>
+        {{end}}
+      </div>
+      {{if .HiddenCloudCount}}<p class="list-note">{{.HiddenCloudCount}} more not shown.</p>{{end}}
+      {{end}}
       {{else}}
       <div class="empty-state"><span aria-hidden="true">◇</span><h3>No notebooks yet</h3><p>Notebooks appear here once a device syncs them to this server.</p></div>
       {{end}}
@@ -428,6 +471,15 @@ button:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 .record-main p, .record-main small { margin: .25rem 0 0; color: var(--muted); font-size: .8rem; }
 .record-state { padding: .15rem .45rem; border-radius: 999px; color: var(--muted); background: #ffffff0a; font-size: .65rem; font-weight: 800; text-transform: uppercase; }
 .record-state.active { color: var(--accent); background: #72e6a510; }
+/* The divider between the synced notebooks and the ones only this server still holds. It sits
+   inside the list rather than above it, so the two groups read as one tab's contents split in two
+   and not as two panels that happen to be adjacent. */
+.list-divider { display: grid; gap: .2rem; padding: 1rem 1.35rem .8rem; border-top: 1px solid var(--border); background: #ffffff04; }
+.list-divider:first-child { border-top: 0; }
+.list-divider h3 { display: flex; align-items: center; gap: .55rem; margin: 0; font-size: .9rem; letter-spacing: -.02em; }
+.list-divider .count-badge { min-width: 1.6rem; height: 1.6rem; font-size: .7rem; }
+.list-divider p { max-width: 46rem; margin: 0; color: var(--muted); font-size: .76rem; line-height: 1.45; }
+.record-icon.cloud { color: #9aa9ff; background: #9aa9ff10; }
 .archive-delete { display: grid; justify-items: end; gap: .35rem; }
 .archive-delete small { color: var(--muted); font-size: .68rem; }
 /* The rename field sizes to its own content rather than taking the shared full-width input rule, so

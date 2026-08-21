@@ -567,6 +567,54 @@ func notebookChange(id string, baseVersion int64, name string) map[string]any {
 	}
 }
 
+// closedNotebookChange is a notebook on the app's shelf: off the rail, contents still on the device.
+func closedNotebookChange(id string, baseVersion int64, name string, closedAt int64) map[string]any {
+	change := notebookChange(id, baseVersion, name)
+	change["closedAt"] = closedAt
+	return change
+}
+
+// deletedNotebookChange is what a client pushes when somebody deletes a notebook. It is an ordinary
+// write of the whole row that happens to carry a tombstone, which is why it can also still be
+// carrying the shelf the notebook was on.
+func deletedNotebookChange(base map[string]any, deletedAt int64) map[string]any {
+	change := make(map[string]any, len(base)+1)
+	for key, value := range base {
+		change[key] = value
+	}
+	change["deletedAt"] = deletedAt
+	return change
+}
+
+// notebookShelf reads the three columns that decide what a notebook's deletion meant, straight from
+// the database, because the point of the retention rule is what was *stored* rather than what the
+// response said.
+func (fixture *syncFixture) notebookShelf(notebookID string) (closedAt *int64, cloudOnlyAt *int64, deletedAt *int64) {
+	fixture.t.Helper()
+
+	if err := fixture.pool.QueryRow(context.Background(),
+		`SELECT closed_at, cloud_only_at, deleted_at FROM notebooks WHERE account_id = $1::uuid AND id = $2`,
+		fixture.accountID, notebookID,
+	).Scan(&closedAt, &cloudOnlyAt, &deletedAt); err != nil {
+		fixture.t.Fatalf("reading the shelf of notebook %q: %v", notebookID, err)
+	}
+	return closedAt, cloudOnlyAt, deletedAt
+}
+
+// notebookExtra is what the server kept of a notebook change it did not recognise.
+func (fixture *syncFixture) notebookExtra(notebookID string) string {
+	fixture.t.Helper()
+
+	var extra string
+	if err := fixture.pool.QueryRow(context.Background(),
+		`SELECT extra::text FROM notebooks WHERE account_id = $1::uuid AND id = $2`,
+		fixture.accountID, notebookID,
+	).Scan(&extra); err != nil {
+		fixture.t.Fatalf("reading the unrecognised fields of notebook %q: %v", notebookID, err)
+	}
+	return extra
+}
+
 func sectionChange(id string, baseVersion int64, notebookID string, name string) map[string]any {
 	return map[string]any{
 		"kind":        "section",

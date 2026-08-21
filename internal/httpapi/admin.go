@@ -49,6 +49,7 @@ type adminStore interface {
 	DeleteRevokedDevices(ctx context.Context, accountID string) (int64, error)
 	NotebookOverview(ctx context.Context, accountID string, limit int) (store.NotebookOverviewResult, error)
 	DeleteArchivedNotebook(ctx context.Context, accountID string, notebookID string) error
+	StopHostingCloudNotebook(ctx context.Context, accountID string, notebookID string) error
 }
 
 type postgresAdminStore struct {
@@ -111,6 +112,10 @@ func (database postgresAdminStore) DeleteArchivedNotebook(ctx context.Context, a
 	return store.DeleteArchivedNotebook(ctx, database.pool, accountID, notebookID)
 }
 
+func (database postgresAdminStore) StopHostingCloudNotebook(ctx context.Context, accountID string, notebookID string) error {
+	return store.StopHostingCloudNotebook(ctx, database.pool, accountID, notebookID)
+}
+
 type adminApplication struct {
 	store    adminStore
 	logger   *slog.Logger
@@ -139,6 +144,7 @@ func (application adminApplication) handler(pool *pgxpool.Pool) http.Handler {
 	mux.HandleFunc("POST /admin/devices/remove-revoked", application.handleRemoveRevokedDevices)
 	mux.HandleFunc("POST /admin/devices/{deviceID}/remove", application.handleRemoveDevice)
 	mux.HandleFunc("POST /admin/notebooks/delete", application.handleDeleteArchivedNotebook)
+	mux.HandleFunc("POST /admin/notebooks/stop-hosting", application.handleStopHostingCloudNotebook)
 
 	return withAdminSecurityHeaders(withPanicRecovery(withRequestLogging(mux, application.logger), application.logger))
 }
@@ -373,23 +379,9 @@ func (application adminApplication) handleDashboard(w http.ResponseWriter, r *ht
 		application.writeAdminError(w, "Could not load synced notebooks.", "listing notebooks for admin failed", err)
 		return
 	}
-	notebookViews := make([]adminNotebookView, 0, len(notebookOverview.Notebooks))
-	for _, notebook := range notebookOverview.Notebooks {
-		notebookViews = append(notebookViews, adminNotebookView{
-			ID:        notebook.ID,
-			Name:      notebook.Name,
-			UpdatedAt: formatAdminTime(notebook.ServerUpdatedAt),
-		})
-	}
-	archivedNotebookViews := make([]adminNotebookView, 0, len(notebookOverview.ArchivedNotebooks))
-	for _, notebook := range notebookOverview.ArchivedNotebooks {
-		archivedNotebookViews = append(archivedNotebookViews, adminNotebookView{
-			ID:                   notebook.ID,
-			Name:                 notebook.Name,
-			UpdatedAt:            formatAdminTime(notebook.ServerUpdatedAt),
-			CanPermanentlyDelete: notebook.ReadyForPermanentDeletion,
-		})
-	}
+	notebookViews := notebookViewsOf(notebookOverview.Notebooks)
+	cloudNotebookViews := notebookViewsOf(notebookOverview.CloudNotebooks)
+	archivedNotebookViews := notebookViewsOf(notebookOverview.ArchivedNotebooks)
 
 	selectedTab := "devices"
 	switch r.URL.Query().Get("tab") {
@@ -409,7 +401,14 @@ func (application adminApplication) handleDashboard(w http.ResponseWriter, r *ht
 		Notebooks:          notebookViews,
 		// Only ever positive when an account has more notebooks than the page will render, which
 		// the list says out loud rather than quietly showing a prefix of the truth.
-		HiddenNotebookCount:   notebookOverview.NotebookCount - int64(len(notebookViews)),
+		HiddenNotebookCount: notebookOverview.NotebookCount - int64(len(notebookViews)),
+		CloudNotebookCount:  notebookOverview.CloudNotebookCount,
+		CloudNotebooks:      cloudNotebookViews,
+		HiddenCloudCount:    notebookOverview.CloudNotebookCount - int64(len(cloudNotebookViews)),
+		// The tab badge counts what the tab holds. Both groups live under Notebooks, so a badge
+		// showing only the synced half would disagree with the page the moment anything moved to
+		// the cloud -- which is the one change this tab exists to make visible.
+		TabNotebookCount:      notebookOverview.NotebookCount + notebookOverview.CloudNotebookCount,
 		ArchivedNotebookCount: notebookOverview.ArchivedNotebookCount,
 		ArchivedNotebooks:     archivedNotebookViews,
 		HiddenArchivedCount:   notebookOverview.ArchivedNotebookCount - int64(len(archivedNotebookViews)),
@@ -417,6 +416,22 @@ func (application adminApplication) handleDashboard(w http.ResponseWriter, r *ht
 		SelectedTab: selectedTab,
 		CSRFToken:   adminCSRFToken(plainSessionToken),
 	})
+}
+
+// notebookViewsOf renders one shelf of the overview. The three groups differ in which controls the
+// template offers them and in nothing else, so they are one conversion rather than three.
+func notebookViewsOf(notebooks []store.NotebookSummary) []adminNotebookView {
+	views := make([]adminNotebookView, 0, len(notebooks))
+	for _, notebook := range notebooks {
+		views = append(views, adminNotebookView{
+			ID:                   notebook.ID,
+			Name:                 notebook.Name,
+			UpdatedAt:            formatAdminTime(notebook.ServerUpdatedAt),
+			Closed:               notebook.Closed,
+			CanPermanentlyDelete: notebook.ReadyForPermanentDeletion,
+		})
+	}
+	return views
 }
 
 // handleRenameDevice relabels a device from the dashboard.
@@ -612,6 +627,51 @@ func (application adminApplication) handleDeleteArchivedNotebook(w http.Response
 	redirectToArchiveList(w, r)
 }
 
+// handleStopHostingCloudNotebook deletes a notebook whose only remaining copy is on this server.
+//
+// The counterpart to the retention rule in the sync path: a closed notebook's delete is refused
+// there because the device asking no longer holds the contents, which leaves this as the only place
+// the account can say it is finished with one. It writes an ordinary tombstone, so the notebook
+// travels to the Archived tab by the same route as any client deletion and is erased for good by
+// the same interlocked action.
+func (application adminApplication) handleStopHostingCloudNotebook(w http.ResponseWriter, r *http.Request) {
+	account, plainSessionToken, ok := application.requireAdminSession(w, r)
+	if !ok {
+		return
+	}
+	if !parseAdminForm(w, r) || !constantTimeTokenMatch(adminCSRFToken(plainSessionToken), r.PostFormValue("csrf_token")) {
+		application.writeAdminPage(w, http.StatusForbidden, adminErrorTemplate, adminErrorPageData{
+			Title:   "Request expired",
+			Message: "Return to the dashboard and try again.",
+		})
+		return
+	}
+
+	notebookID := r.PostFormValue("notebook_id")
+	err := application.store.StopHostingCloudNotebook(r.Context(), account.ID, notebookID)
+	if errors.Is(err, store.ErrNotebookNotCloudHosted) {
+		application.writeAdminPage(w, http.StatusConflict, adminErrorTemplate, adminErrorPageData{
+			Title:   "Notebook is not on the cloud",
+			Message: "Only a notebook this server holds the last copy of can be deleted here. A notebook that is still on a device is deleted from the app, and one that is already archived is finished with from the Archived tab.",
+		})
+		return
+	}
+	if errors.Is(err, store.ErrNotebookNotFound) {
+		application.writeAdminPage(w, http.StatusNotFound, adminErrorTemplate, adminErrorPageData{
+			Title:   "Notebook not found",
+			Message: "That notebook does not exist for this account.",
+		})
+		return
+	}
+	if err != nil {
+		application.writeAdminError(w, "Could not delete the notebook.", "deleting a cloud-hosted notebook from admin failed", err)
+		return
+	}
+
+	application.logger.Info("cloud-hosted notebook deleted from admin panel", "account_id", account.ID, "notebook_id", notebookID)
+	redirectToNotebookList(w, r)
+}
+
 func (application adminApplication) handleLogout(w http.ResponseWriter, r *http.Request) {
 	_, plainSessionToken, err := application.accountFromSession(r)
 	if errors.Is(err, store.ErrAdminSessionNotFound) {
@@ -749,6 +809,10 @@ func redirectToDeviceList(w http.ResponseWriter, r *http.Request) {
 
 func redirectToArchiveList(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin?tab=archived#contents", http.StatusSeeOther)
+}
+
+func redirectToNotebookList(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/admin?tab=notebooks#contents", http.StatusSeeOther)
 }
 
 func parseAdminForm(w http.ResponseWriter, r *http.Request) bool {

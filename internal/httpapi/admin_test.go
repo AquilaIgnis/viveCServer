@@ -22,17 +22,20 @@ import (
 )
 
 type fakeAdminStore struct {
-	accountCount       int64
-	account            store.Account
-	sessions           map[string]string
-	devices            []store.Device
-	notebooks          []store.NotebookSummary
-	archivedNotebooks  []store.NotebookSummary
-	deleteNotebookErr  error
-	deletedNotebookIDs []string
-	revokedID          string
-	renamedID          string
-	removedIDs         []string
+	accountCount        int64
+	account             store.Account
+	sessions            map[string]string
+	devices             []store.Device
+	notebooks           []store.NotebookSummary
+	cloudNotebooks      []store.NotebookSummary
+	archivedNotebooks   []store.NotebookSummary
+	deleteNotebookErr   error
+	deletedNotebookIDs  []string
+	unhostNotebookErr   error
+	unhostedNotebookIDs []string
+	revokedID           string
+	renamedID           string
+	removedIDs          []string
 }
 
 func (database *fakeAdminStore) CountAccounts(context.Context) (int64, error) {
@@ -164,9 +167,11 @@ func (database *fakeAdminStore) NotebookOverview(_ context.Context, accountID st
 	}
 	overview := store.NotebookOverviewResult{
 		NotebookCount:         int64(len(database.notebooks)),
+		CloudNotebookCount:    int64(len(database.cloudNotebooks)),
 		ArchivedNotebookCount: int64(len(database.archivedNotebooks)),
 	}
 	overview.Notebooks = database.notebooks[:min(len(database.notebooks), limit)]
+	overview.CloudNotebooks = database.cloudNotebooks[:min(len(database.cloudNotebooks), limit)]
 	overview.ArchivedNotebooks = database.archivedNotebooks[:min(len(database.archivedNotebooks), limit)]
 	return overview, nil
 }
@@ -189,6 +194,30 @@ func (database *fakeAdminStore) DeleteArchivedNotebook(_ context.Context, accoun
 	for _, notebook := range database.notebooks {
 		if notebook.ID == notebookID {
 			return store.ErrNotebookNotArchived
+		}
+	}
+	return store.ErrNotebookNotFound
+}
+
+func (database *fakeAdminStore) StopHostingCloudNotebook(_ context.Context, accountID string, notebookID string) error {
+	if accountID != database.account.ID {
+		return store.ErrNotebookNotFound
+	}
+	if database.unhostNotebookErr != nil {
+		return database.unhostNotebookErr
+	}
+	for index, notebook := range database.cloudNotebooks {
+		if notebook.ID != notebookID {
+			continue
+		}
+		database.cloudNotebooks = append(database.cloudNotebooks[:index], database.cloudNotebooks[index+1:]...)
+		database.archivedNotebooks = append(database.archivedNotebooks, notebook)
+		database.unhostedNotebookIDs = append(database.unhostedNotebookIDs, notebookID)
+		return nil
+	}
+	for _, notebook := range append(append([]store.NotebookSummary{}, database.notebooks...), database.archivedNotebooks...) {
+		if notebook.ID == notebookID {
+			return store.ErrNotebookNotCloudHosted
 		}
 	}
 	return store.ErrNotebookNotFound
@@ -573,6 +602,143 @@ func TestDashboardCountsAndNamesNotebooks(t *testing.T) {
 // TestDashboardShowsClientDeletesInTheArchive: a client deletion remains a sync tombstone in the
 // database, and the dashboard gives that durable row a place of its own instead of making it look
 // as though the server discarded it.
+// TestNotebooksTabDividesSyncedFromCloudHosted: the two groups differ in where the bytes are, which
+// is the difference the operator is looking at the tab to see. A single list would have to say it in
+// prose on every row.
+func TestNotebooksTabDividesSyncedFromCloudHosted(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := time.Date(2026, 8, 20, 9, 30, 0, 0, time.UTC)
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		notebooks: []store.NotebookSummary{
+			{ID: "nb-1", Name: "Field notes", ServerUpdatedAt: updatedAt},
+			{ID: "nb-2", Name: "Old sketches", ServerUpdatedAt: updatedAt, Closed: true},
+		},
+		cloudNotebooks: []store.NotebookSummary{
+			{ID: "nb-3", Name: "Archive 2019", ServerUpdatedAt: updatedAt, Closed: true},
+		},
+		sessions: map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin?tab=notebooks", nil)
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", response.Code)
+	}
+	// The badge counts the tab, not one of the two groups under it. Matched without the opening
+	// tag because a selected tab carries an aria-current attribute the devices tab does not.
+	if !strings.Contains(body, `>Notebooks <span class="count-badge">3</span>`) {
+		t.Fatal("the notebooks tab badge does not count both groups")
+	}
+	syncedHeading := strings.Index(body, `<h3>Synced <span class="count-badge">2</span>`)
+	cloudHeading := strings.Index(body, `<h3>On cloud <span class="count-badge">1</span>`)
+	if syncedHeading < 0 || cloudHeading < 0 {
+		t.Fatal("the notebooks tab is missing one of its two dividers")
+	}
+	if syncedHeading > cloudHeading {
+		t.Fatal("the cloud group is above the synced one, which reads as the exception being the rule")
+	}
+	if !strings.Contains(body, "Archive 2019") || !strings.Contains(body, "Field notes") {
+		t.Fatal("a notebook name is missing from the tab")
+	}
+	// Only a cloud-hosted notebook can be unhosted, so only its rows carry the form.
+	if strings.Count(body, `action="/admin/notebooks/stop-hosting"`) != 1 {
+		t.Fatalf("stop-hosting forms = %d, want exactly the one cloud notebook",
+			strings.Count(body, `action="/admin/notebooks/stop-hosting"`))
+	}
+	// Closed is worth saying on the synced list, where it distinguishes two rows. It is not worth
+	// saying on the cloud list, where every row is closed by definition.
+	if strings.Count(body, `<span class="record-state">Closed</span>`) != 1 {
+		t.Fatal("the Closed badge is not on exactly the one shelved-but-present notebook")
+	}
+}
+
+// TestNotebooksTabWithNothingOnTheCloudShowsNoDivider: a divider appears when there is something to
+// divide. With every notebook on the devices the distinction is one the operator cannot act on.
+func TestNotebooksTabWithNothingOnTheCloudShowsNoDivider(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		notebooks:    []store.NotebookSummary{{ID: "nb-1", Name: "Field notes"}},
+		sessions:     map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/admin?tab=notebooks", nil)
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+
+	if strings.Contains(body, "On cloud") {
+		t.Fatal("an empty cloud group was still given a heading")
+	}
+	if strings.Contains(body, "/admin/notebooks/stop-hosting") {
+		t.Fatal("a stop-hosting form was rendered with nothing on the cloud")
+	}
+}
+
+// TestStopHostingRequiresCSRFAndReturnsToTheNotebooks: the same shape as every other destructive
+// admin action, and it lands back on the tab it acted on rather than at the top of the page.
+func TestStopHostingRequiresCSRFAndReturnsToTheNotebooks(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount:   1,
+		account:        store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		notebooks:      []store.NotebookSummary{{ID: "nb-live", Name: "Work"}},
+		cloudNotebooks: []store.NotebookSummary{{ID: "nb-cloud", Name: "Archive 2019", Closed: true}},
+		sessions:       map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	post := func(notebookID string, csrf string) *httptest.ResponseRecorder {
+		t.Helper()
+		form := url.Values{"notebook_id": {notebookID}, "csrf_token": {csrf}}
+		request := httptest.NewRequest(http.MethodPost, "/admin/notebooks/stop-hosting", strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	if response := post("nb-cloud", "wrong"); response.Code != http.StatusForbidden {
+		t.Fatalf("stop hosting without valid CSRF = %d, want 403", response.Code)
+	}
+	if len(database.cloudNotebooks) != 1 {
+		t.Fatal("invalid CSRF deleted the notebook anyway")
+	}
+
+	// A notebook the devices still hold is refused by the store, and the panel says why.
+	if response := post("nb-live", adminCSRFToken(plainToken)); response.Code != http.StatusConflict {
+		t.Fatalf("stop hosting a synced notebook = %d, want 409", response.Code)
+	}
+
+	response := post("nb-cloud", adminCSRFToken(plainToken))
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/admin?tab=notebooks#contents" {
+		t.Fatalf("successful stop hosting = %d %q, want 303 back to Notebooks", response.Code, response.Header().Get("Location"))
+	}
+	if fmt.Sprint(database.unhostedNotebookIDs) != "[nb-cloud]" || len(database.cloudNotebooks) != 0 {
+		t.Fatalf("unhosted ids = %v with %d cloud rows left, want only nb-cloud", database.unhostedNotebookIDs, len(database.cloudNotebooks))
+	}
+}
+
 func TestDashboardShowsClientDeletesInTheArchive(t *testing.T) {
 	plainToken, tokenHash, err := auth.MintAdminSessionToken()
 	if err != nil {

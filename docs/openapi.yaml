@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.5.0
+  version: 0.6.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -27,6 +27,12 @@ info:
     document body is, and each operation carries the ids of the strokes it affected inside itself.
     Ink conflicts are rare by construction rather than by rule — two devices never write the same
     stroke id — so it takes the same optimistic concurrency path as everything else.
+
+    A notebook carries the shelf it sits on: `closedAt` says it has left the app's rail, and
+    `cloudOnlyAt` says this server holds the only copy of its contents. The server acts on the first
+    of those. A push that deletes a notebook the server has stored as closed does not store a
+    tombstone — it keeps the notebook and marks it `cloudOnlyAt` instead, so the contents stay
+    hosted and any device can download them again. See `POST /v1/changes`.
 
     Attachment bytes (S5) are addressed by content, at `/v1/blobs/{sha256}`, and are the one part of
     a notebook that does not travel through the change protocol. Upload the bytes first, then push
@@ -386,6 +392,20 @@ paths:
         replay window returns the original response instead of applying the work a second time,
         which is what makes a push safe to retry when its response was lost.
 
+        **Deleting a closed notebook keeps it.** A `notebook` change carrying `deletedAt` is stored
+        as a tombstone only while the notebook is open. If the notebook is closed — by this change
+        or by an earlier one — the server stores it live with `cloudOnlyAt` set instead, because a
+        device that has moved a notebook to the cloud no longer holds the contents it would be
+        asking the server to erase. The change is still reported under `applied` and still receives
+        the next version; what was stored differs from what was sent, and the next pull is where the
+        client sees the notebook return as cloud-only. Two rows are exempt, both because there is
+        nothing hosted to keep: one the account has no row for at all, and one that is already a
+        tombstone. A notebook that is open when it is deleted is deleted, as before.
+
+        A notebook the server keeps this way can only be deleted from a device by bringing it back
+        and reopening it first. The server owner can also delete it from the administration panel,
+        which writes an ordinary tombstone that pulls like any other.
+
         Send at most 512 changes and 4 MB per request; paginate beyond that.
       security:
         - deviceToken: []
@@ -406,6 +426,8 @@ paths:
                   colorArgb: -16777216
                   sortIndex: 0
                   expanded: true
+                  closedAt: null
+                  cloudOnlyAt: null
                   createdAt: 1755300000000
       responses:
         "200":
@@ -1062,6 +1084,26 @@ components:
         expanded:
           type: boolean
           description: Rail expansion state. Synced for now because it lives on the entity.
+        closedAt:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Client wall clock at which the notebook left the app's rail, or null while it is open.
+            Omitting the key on a push means the same as null and will reopen a closed notebook, so
+            send it explicitly on every notebook change.
+
+            The server reads this to decide what a deletion of this notebook means; see
+            `POST /v1/changes`.
+        cloudOnlyAt:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Client wall clock from which this server holds the only copy of the notebook's
+            contents, or null while a device still has them. A notebook with this set is always
+            also closed. Its sections and pages are still expected on the devices, which is what
+            keeps a pulled change under it from arriving with no parent.
+
+            The server sets this itself when it keeps a closed notebook a client asked to delete.
         createdAt:
           type: integer
           format: int64
