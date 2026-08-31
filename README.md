@@ -24,7 +24,8 @@ Once ready use :
 docker compose up -d
 ```
 
-> [!IMPORTANT] You have to correct blob directory ownership if it shares parent with the DB
+> [!IMPORTANT]
+> You have to correct blob directory ownership if it shares parent with the DB
 
 For example:
 

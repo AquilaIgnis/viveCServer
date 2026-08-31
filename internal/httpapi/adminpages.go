@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/AquilaIgnis/viveCServer/assets"
+	"github.com/AquilaIgnis/viveCServer/internal/version"
 )
 
 // assetCacheControl is as aggressive as it is only because the paths carry a content digest: a
@@ -254,7 +255,18 @@ var dashboardPageHTML = pageHead + `<title>Admin · viveCServer</title>
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/admin"><span class="brand-mark small" aria-hidden="true">V</span><span>viveCServer</span></a>
+    <!-- Both numbers sit with the name because they are part of what this server is called when an
+         operator reports something about it. They are two separate questions -- which build is
+         running, and which device/sync contract that build answers -- so they are two tags rather
+         than one string: most releases move only the first, and a single number would hide that.
+         Only on the signed-in panel: the login page is served to anyone who reaches the port, and
+         what an unauthenticated visitor learns there should not include which build to look up
+         known problems for. -->
+    <div class="topbar-identity">
+      <a class="brand" href="/admin"><span class="brand-mark small" aria-hidden="true">V</span><span>viveCServer</span></a>
+      <span class="version-tag"><span class="visually-hidden">Server version </span>v` + version.Current + `</span>
+      <span class="version-tag">sync API ` + version.OpenApi + `</span>
+    </div>
     <form method="post" action="/logout">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <button type="submit" class="button-secondary">Sign out</button>
@@ -481,6 +493,8 @@ button:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 .notice.success { border-color: #295f40; color: #b9f8d2; background: var(--success-bg); }
 .topbar { display: flex; align-items: center; justify-content: space-between; min-height: 4.5rem; padding: .75rem max(1rem, calc((100vw - 70rem) / 2)); border-bottom: 1px solid var(--border); background: #090c0bdd; backdrop-filter: blur(1rem); }
 .brand { display: flex; align-items: center; gap: .7rem; color: var(--text); font-weight: 850; text-decoration: none; }
+.topbar-identity { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem; }
+.version-tag { padding: .2rem .45rem; border: 1px solid var(--border); border-radius: .45rem; color: var(--muted); background: var(--surface-raised); font-size: .7rem; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 0; white-space: nowrap; }
 .dashboard { width: min(100% - 2rem, 70rem); margin: 0 auto; padding: 4.5rem 0 2rem; }
 .hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 2rem; }
 .hero .lede { margin-bottom: 0; }

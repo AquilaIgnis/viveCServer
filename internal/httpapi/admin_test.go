@@ -19,6 +19,7 @@ import (
 	"github.com/AquilaIgnis/viveCServer/internal/config"
 	"github.com/AquilaIgnis/viveCServer/internal/livelog"
 	"github.com/AquilaIgnis/viveCServer/internal/store"
+	"github.com/AquilaIgnis/viveCServer/internal/version"
 )
 
 type fakeAdminStore struct {
@@ -1340,4 +1341,49 @@ func responseCookie(t *testing.T, response *http.Response, name string) *http.Co
 	}
 	t.Fatalf("response did not set cookie %q", name)
 	return nil
+}
+
+// TestDashboardShowsBothVersionsAndTheLoginPageDoesNot: an operator upgrading a container needs the
+// running build to say what it is and which sync contract it answers, and the signed-in panel is
+// where they can be shown both without also telling every unauthenticated visitor which release to
+// look up problems for.
+func TestDashboardShowsBothVersionsAndTheLoginPageDoesNot(t *testing.T) {
+	plainToken, tokenHash, err := auth.MintAdminSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := &fakeAdminStore{
+		accountCount: 1,
+		account:      store.Account{ID: "10000000-0000-0000-0000-000000000001", Email: "owner@example.com"},
+		sessions:     map[string]string{string(tokenHash): "10000000-0000-0000-0000-000000000001"},
+	}
+	handler := newAdminTestHandler(database)
+
+	dashboard := httptest.NewRecorder()
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	dashboardRequest.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: plainToken})
+	handler.ServeHTTP(dashboard, dashboardRequest)
+
+	if dashboard.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", dashboard.Code)
+	}
+	if !strings.Contains(dashboard.Body.String(), `v`+version.Current+`</span>`) {
+		t.Fatalf("the dashboard does not show server version %s", version.Current)
+	}
+	if !strings.Contains(dashboard.Body.String(), `<span class="version-tag">sync API `+version.OpenApi+`</span>`) {
+		t.Fatalf("the dashboard does not show sync API version %s", version.OpenApi)
+	}
+
+	login := httptest.NewRecorder()
+	handler.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "/login", nil))
+
+	if login.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want 200", login.Code)
+	}
+	if strings.Contains(login.Body.String(), version.Current) {
+		t.Fatal("the signed-out login page names the server version")
+	}
+	if strings.Contains(login.Body.String(), version.OpenApi) {
+		t.Fatal("the signed-out login page names the sync API version")
+	}
 }
