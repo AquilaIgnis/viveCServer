@@ -18,6 +18,8 @@ services:
       POSTGRES_PASSWORD: ${VIVE_POSTGRES_PASSWORD:-vive-local-only}
     volumes:
       - ./data/postgres:/var/lib/postgresql:Z
+    # ports:
+    #   - "${VIVE_POSTGRES_BIND:-127.0.0.1}:${VIVE_POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U vive -d vive']
       interval: 2s
@@ -44,8 +46,8 @@ services:
       # sudo chown -R 1000:1000 deploy/data/blobs
       - ./data/blobs:/var/lib/vivecserver/blobs:Z
     ports:
-      - '${VIVE_ADMIN_PORT:-8080}:8080'
-      - '${VIVE_SYNC_PORT:-5444}:8281'
+      - '${VIVE_ADMIN_PORT:-8182}:8080'
+      - '${VIVE_SYNC_PORT:-5442}:8281'
     # The server migrates on startup, so it must not race PostgreSQL's first boot. Waiting for
     # healthy rather than started is the difference between a clean `up` and one that fails on the
     depends_on:
