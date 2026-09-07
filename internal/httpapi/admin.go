@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AquilaIgnis/viveCServer/internal/auth"
+	"github.com/AquilaIgnis/viveCServer/internal/changefeed"
 	"github.com/AquilaIgnis/viveCServer/internal/livelog"
 	"github.com/AquilaIgnis/viveCServer/internal/store"
 )
@@ -117,9 +118,10 @@ func (database postgresAdminStore) StopHostingCloudNotebook(ctx context.Context,
 }
 
 type adminApplication struct {
-	store    adminStore
-	logger   *slog.Logger
-	liveLogs *livelog.Broker
+	store        adminStore
+	logger       *slog.Logger
+	liveLogs     *livelog.Broker
+	changeEvents *changefeed.Broker
 }
 
 func (application adminApplication) handler(pool *pgxpool.Pool) http.Handler {
@@ -504,6 +506,7 @@ func (application adminApplication) handleRevokeDevice(w http.ResponseWriter, r 
 		return
 	}
 	application.logger.Info("device revoked from admin panel", "account_id", account.ID, "device_id", deviceID)
+	application.changeEvents.Revoke(account.ID, deviceID)
 	redirectToDevice(w, r, deviceID)
 }
 
@@ -620,6 +623,7 @@ func (application adminApplication) handleDeleteArchivedNotebook(w http.Response
 	}
 
 	application.logger.Info("archived notebook permanently deleted from admin panel", "account_id", account.ID, "notebook_id", notebookID)
+	application.changeEvents.Publish(account.ID, "")
 	redirectToArchiveList(w, r)
 }
 
@@ -665,6 +669,7 @@ func (application adminApplication) handleStopHostingCloudNotebook(w http.Respon
 	}
 
 	application.logger.Info("cloud-hosted notebook deleted from admin panel", "account_id", account.ID, "notebook_id", notebookID)
+	application.changeEvents.Publish(account.ID, "")
 	redirectToNotebookList(w, r)
 }
 

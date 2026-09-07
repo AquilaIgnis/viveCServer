@@ -70,11 +70,12 @@ type PullResult struct {
 // earlier change is still invisible.
 //
 // Returns the marshalled response rather than the struct: those exact bytes are what a retry has to
-// replay, and re-encoding them later would let the two answers drift.
-func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushRequest) (json.RawMessage, error) {
+// replay, and re-encoding them later would let the two answers drift. The boolean is true only when
+// this call committed new rows, so the HTTP layer never broadcasts an idempotent replay.
+func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushRequest) (json.RawMessage, bool, error) {
 	transaction, err := store.BeginAccountWrite(ctx, pool, request.Caller.AccountID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = transaction.Rollback(ctx) }()
 
@@ -83,10 +84,10 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 		ctx, transaction, request.Caller.DeviceID, request.BatchID, request.ReplayWindow,
 	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if alreadyApplied {
-		return storedResponse, nil
+		return storedResponse, false, nil
 	}
 
 	decoded := decodeChanges(request.Changes)
@@ -119,7 +120,7 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 
 		batchContext, err := readBatchContext(ctx, transaction, request.Caller.AccountID, kind, run)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		for _, change := range run {
@@ -259,40 +260,40 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 	cursor := int64(0)
 	if len(pendingWrites) > 0 {
 		// Allocated only now, so a batch that was refused in full burns no sequence number and
-		// leaves every other device's idle poll with nothing to fetch.
+		// emits no change-feed wakeup to the account's other devices.
 		allocatedSeq, err := store.AllocateChangeSeq(ctx, transaction, request.Caller.AccountID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		for index := range pendingWrites {
 			pendingWrites[index].Envelope.ChangeSeq = allocatedSeq
 		}
 		if err := store.WriteChanges(ctx, transaction, pendingWrites); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		cursor = allocatedSeq
 	} else {
 		cursor, err = store.ReadChangeSeq(ctx, transaction, request.Caller.AccountID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
 	response, err := json.Marshal(PushResult{Applied: applied, Rejected: rejected, Cursor: cursor})
 	if err != nil {
-		return nil, fmt.Errorf("encoding a push response: %w", err)
+		return nil, false, fmt.Errorf("encoding a push response: %w", err)
 	}
 
 	if err := store.RecordAppliedBatchResponse(
 		ctx, transaction, request.Caller.DeviceID, request.BatchID, response, request.ReplayWindow,
 	); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if err := transaction.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("committing a push: %w", err)
+		return nil, false, fmt.Errorf("committing a push: %w", err)
 	}
-	return response, nil
+	return response, len(pendingWrites) > 0, nil
 }
 
 // batchContext is everything one kind's run needs from the database, read once for the whole run.

@@ -66,9 +66,8 @@ func (w *statusRecordingWriter) ReadFrom(source io.Reader) (int64, error) {
 // withRequestLogging records one line per request.
 //
 // Health checks log at debug rather than info on purpose. Compose probes readiness every couple of
-// seconds and every client polls on a 60 s cycle (syncPlan.md SD6), so these two paths would
-// otherwise be nearly all of the log volume and would bury the requests an operator actually wants
-// to see. A failing probe still reports itself from the handler.
+// seconds, so they would otherwise be nearly all of the idle log volume and bury the requests an
+// operator actually wants to see. A failing probe still reports itself from the handler.
 func withRequestLogging(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedAt := time.Now()

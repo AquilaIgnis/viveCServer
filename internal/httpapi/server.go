@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AquilaIgnis/viveCServer/internal/blob"
+	"github.com/AquilaIgnis/viveCServer/internal/changefeed"
 	"github.com/AquilaIgnis/viveCServer/internal/config"
 	"github.com/AquilaIgnis/viveCServer/internal/livelog"
 )
@@ -31,6 +32,10 @@ type Options struct {
 	Blobs blob.Store
 
 	BlobLimits BlobLimits
+
+	// ChangeEvents wakes connected devices after a committed account write. Nil creates a broker
+	// private to this handler, which keeps small tests and embedded uses functional.
+	ChangeEvents *changefeed.Broker
 }
 
 // BlobLimits bounds attachment storage.
@@ -51,6 +56,10 @@ type BlobLimits struct {
 func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) http.Handler {
 	mux := http.NewServeMux()
 	authenticated := requireAuthentication(pool, logger)
+	changeEvents := options.ChangeEvents
+	if changeEvents == nil {
+		changeEvents = changefeed.NewBroker()
+	}
 
 	mux.HandleFunc("GET /healthz", handleLiveness())
 	mux.HandleFunc("GET /readyz", handleReadiness(pool, logger))
@@ -62,7 +71,7 @@ func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) ht
 	// Everything else requires a device token.
 	mux.Handle("GET /v1/devices", authenticated(handleListDevices(pool, logger)))
 	mux.Handle("PATCH /v1/devices/{deviceID}", authenticated(handleRenameDevice(pool, logger)))
-	mux.Handle("DELETE /v1/devices/{deviceID}", authenticated(handleRevokeDevice(pool, logger)))
+	mux.Handle("DELETE /v1/devices/{deviceID}", authenticated(handleRevokeDevice(pool, logger, changeEvents)))
 
 	// Attachment bytes. Registered only when there is somewhere to put them, so a build without a
 	// blob directory answers 404 rather than 500.
@@ -79,7 +88,8 @@ func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) ht
 
 	mux.Handle("GET /v1/cursor", authenticated(handleReadCursor(pool, logger)))
 	mux.Handle("GET /v1/changes", authenticated(handlePullChanges(pool, logger)))
-	mux.Handle("POST /v1/changes", authenticated(handlePushChanges(pool, logger, options.BatchReplayWindow)))
+	mux.Handle("GET /v1/changes/watch", authenticated(handleWatchChanges(pool, changeEvents, logger)))
+	mux.Handle("POST /v1/changes", authenticated(handlePushChanges(pool, logger, options.BatchReplayWindow, changeEvents)))
 
 	// Compression sits inside the logger so the log records the status the handler chose, and
 	// inside recovery so a panic in a compressed response still becomes a 500.
@@ -88,8 +98,18 @@ func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) ht
 
 // NewAdminHandler builds the browser-only setup and administration surface. It intentionally does
 // not register /v1 routes: publishing port 8080 must never accidentally publish the sync API too.
-func NewAdminHandler(pool *pgxpool.Pool, logger *slog.Logger, liveLogs *livelog.Broker) http.Handler {
-	application := adminApplication{store: postgresAdminStore{pool: pool}, logger: logger, liveLogs: liveLogs}
+func NewAdminHandler(
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+	liveLogs *livelog.Broker,
+	changeEvents *changefeed.Broker,
+) http.Handler {
+	application := adminApplication{
+		store:        postgresAdminStore{pool: pool},
+		logger:       logger,
+		liveLogs:     liveLogs,
+		changeEvents: changeEvents,
+	}
 	return application.handler(pool)
 }
 

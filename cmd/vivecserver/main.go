@@ -20,6 +20,7 @@ import (
 
 	"github.com/AquilaIgnis/viveCServer/internal/blob"
 	"github.com/AquilaIgnis/viveCServer/internal/blobsweep"
+	"github.com/AquilaIgnis/viveCServer/internal/changefeed"
 	"github.com/AquilaIgnis/viveCServer/internal/config"
 	"github.com/AquilaIgnis/viveCServer/internal/httpapi"
 	"github.com/AquilaIgnis/viveCServer/internal/livelog"
@@ -76,6 +77,7 @@ func run() error {
 	}
 
 	liveLogBroker := livelog.NewBroker()
+	changeEventBroker := changefeed.NewBroker()
 	stdoutLogHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: settings.LogLevel})
 	logger := slog.New(livelog.NewHandler(stdoutLogHandler, liveLogBroker))
 
@@ -117,12 +119,13 @@ func run() error {
 	}()
 	defer sweeperFinished.Wait()
 
-	adminServer := newHTTPServer(settings.AdminListenAddress, httpapi.NewAdminHandler(pool, logger, liveLogBroker))
+	adminServer := newHTTPServer(settings.AdminListenAddress, httpapi.NewAdminHandler(pool, logger, liveLogBroker, changeEventBroker))
 	syncServer := newHTTPServer(settings.SyncListenAddress, httpapi.NewSyncHandler(pool, logger, httpapi.Options{
 		SignupMode:        settings.SignupMode,
 		BatchReplayWindow: settings.BatchReplayWindow,
 		Blobs:             blobs,
 		BlobLimits:        httpapi.BlobLimits{MaxBlobBytes: settings.MaxBlobBytes},
+		ChangeEvents:      changeEventBroker,
 	}))
 	servers := []namedHTTPServer{
 		{name: "admin", server: adminServer},

@@ -6,9 +6,9 @@ import "encoding/json"
 //
 // The JSON names match NotebookEntity in the app
 // (app/src/main/java/com/vivenotes/data/db/Entities.kt) field for field, because the app pushes its
-// row as it stands rather than translating it first. `expanded` is arguably per-device rail state
-// and belongs in DataStore by the app's own rule, but it lives on the entity, so it syncs for now
-// (syncPlan.md §12.2).
+// row as it stands rather than translating it first. `expanded` remains on the wire for contract
+// compatibility, but current clients preserve their device-local rail state when applying rows and
+// do not queue expansion-only writes.
 //
 // `closedAt` and `cloudOnlyAt` are the shelf a notebook sits on. They are account-wide by the app's
 // own decision — the flag travels on the entity, so it goes where the entity goes — and this server

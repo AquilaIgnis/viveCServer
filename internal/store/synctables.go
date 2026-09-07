@@ -380,9 +380,8 @@ func AllocateChangeSeq(ctx context.Context, transaction pgx.Tx, accountID string
 	return allocated, nil
 }
 
-// ReadChangeSeq returns an account's current cursor. This is the whole of the idle poll: one
-// primary-key read, which is what lets a client with nothing to do wake every 60 seconds without
-// costing anything (SD6).
+// ReadChangeSeq returns an account's current cursor. It is one primary-key read for launch and
+// event-stream reconnect catch-up; an idle connected client waits on the change feed instead.
 func ReadChangeSeq(ctx context.Context, database Querier, accountID string) (int64, error) {
 	var cursor int64
 	err := database.QueryRow(ctx, `SELECT change_seq FROM accounts WHERE id = $1::uuid`, accountID).Scan(&cursor)

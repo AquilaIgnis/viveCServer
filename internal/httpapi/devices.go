@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AquilaIgnis/viveCServer/internal/auth"
+	"github.com/AquilaIgnis/viveCServer/internal/changefeed"
 	"github.com/AquilaIgnis/viveCServer/internal/store"
 )
 
@@ -212,7 +213,7 @@ func handleRenameDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFun
 }
 
 // handleRevokeDevice makes a device's token stop working, including the calling device's own.
-func handleRevokeDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
+func handleRevokeDevice(pool *pgxpool.Pool, logger *slog.Logger, changeEvents *changefeed.Broker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		caller, ok := authenticatedDeviceOrFail(w, r, logger)
 		if !ok {
@@ -238,6 +239,7 @@ func handleRevokeDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFun
 			"revoked_by", caller.DeviceID,
 			"self", targetDeviceID == caller.DeviceID,
 		)
+		changeEvents.Revoke(caller.AccountID, targetDeviceID)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

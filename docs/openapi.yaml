@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.8.0
+  version: 0.9.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -13,11 +13,13 @@ info:
     `POST /v1/devices` once with the account credentials and stores the returned device token.
     Subsequent authenticated requests use that token as a Bearer credential.
 
-    Synchronisation covers the notebook, section, and page hierarchy. A client keeps one cursor per
-    account, polls `GET /v1/cursor`, pulls with `GET /v1/changes` when it has moved, and pushes its
-    own edits with `POST /v1/changes`. Concurrency is optimistic: every entity carries a
-    server-assigned `version`, a push states the version it believes it is editing, and a push that
-    lost the race comes back with the current server state rather than overwriting it.
+    Synchronisation covers the notebook, section, and page hierarchy. While active, a client holds
+    `GET /v1/changes/watch`, supplying its last committed cursor. The stream sends the initial
+    backlog and every later peer change as authoritative pull-shaped pages; no follow-up cursor or
+    delta request is needed. The client pushes its own edits with `POST /v1/changes`. Concurrency is
+    optimistic: every entity carries a server-assigned `version`, a push states the version it
+    believes it is editing, and a push that lost the race comes back with the current server state
+    rather than overwriting it.
 
     Document bodies are the `pageContent` kind (S3): opaque bytes with a codec id and a checksum,
     which the server stores and returns without ever parsing.
@@ -311,9 +313,10 @@ paths:
       tags: [Sync]
       summary: Read the account's current change cursor
       description: |
-        The idle poll. A client compares this value with its own stored cursor and pulls only when
-        they differ, so a client with an empty outbox and nothing to fetch makes this one request
-        per interval and stops. The server answers it with a single primary-key read.
+        Compatibility and explicit one-shot catch-up endpoint. A client compares this value with
+        its own stored cursor and pulls only when they differ. Current clients do not use it for
+        foreground launch, reconnect, or change delivery: `GET /v1/changes/watch` carries those
+        deltas itself. It is never intended to be polled on an idle timer.
       security:
         - deviceToken: []
       responses:
@@ -325,6 +328,60 @@ paths:
                 $ref: "#/components/schemas/CursorResponse"
               example:
                 cursor: 41
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/changes/watch:
+    get:
+      operationId: watchChanges
+      tags: [Sync]
+      summary: Wait for another writer to commit account content
+      description: |
+        An authenticated Server-Sent Events stream. The client supplies the last cursor it has
+        committed locally in `since`. The server installs this device's subscription before reading
+        the database, then sends a `ready` event whose data is the first PullChangesResponse page.
+        Remaining initial pages and later commits arrive as `changes` events with the same schema.
+        No cursor check or pull request follows an event.
+
+        A device does not receive a `changes` event for its own push. Empty batches, fully rejected
+        batches, and idempotent batch replays do not wake peers. Broker wakeups may be coalesced, but
+        the server reads every row after the stream cursor before emitting, so no content is lost.
+        The server sends no heartbeat. Mobile clients should hold the stream only while active and
+        reconnect with bounded backoff using their last transactionally committed cursor.
+
+        If the authenticated device is revoked while connected, the server sends a terminal
+        `revoked` event and closes the stream. The client must discard that account credential.
+      security:
+        - deviceToken: []
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Exclusive lower bound; the last cursor the device committed locally.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: |
+            A stream of `ready`, `changes`, or terminal `revoked` events. The data of `ready` and
+            `changes` is a PullChangesResponse JSON object.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: ready
+                data: {"changes":[],"purges":[],"cursor":41,"hasMore":false}
+
+                event: changes
+                data: {"changes":[{"kind":"notebook","id":"756f7fb6-c35a-4478-b875-c3f9836ed651","version":2,"seq":42,"deletedAt":null,"updatedAt":1757280000000,"name":"Work","colorArgb":-14575885,"sortIndex":0,"expanded":true,"createdAt":1757193600000}],"purges":[],"cursor":42,"hasMore":false}
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
         "401":
           $ref: "#/components/responses/Unauthenticated"
         "500":
@@ -1140,7 +1197,7 @@ components:
           format: int32
         expanded:
           type: boolean
-          description: Rail expansion state. Synced for now because it lives on the entity.
+          description: Legacy compatibility field. Current clients keep rail expansion device-local.
         closedAt:
           type: [integer, "null"]
           format: int64

@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/AquilaIgnis/viveCServer/internal/changefeed"
 	"github.com/AquilaIgnis/viveCServer/internal/store"
 	"github.com/AquilaIgnis/viveCServer/internal/syncengine"
 )
@@ -36,11 +37,8 @@ type pushChangesRequest struct {
 	Changes []json.RawMessage `json:"changes"`
 }
 
-// handleReadCursor answers the idle poll.
-//
-// This is the request a client makes every 60 seconds with nothing to do (SD6), so it stays a
-// single primary-key read: no delta, no join, and nothing written. A client whose cursor matches
-// and whose outbox is empty makes this one request and goes back to sleep.
+// handleReadCursor remains the cheap compatibility/manual catch-up check. Current foreground
+// clients reconnect the event stream with their stored cursor and receive the delta there instead.
 func handleReadCursor(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		caller, ok := authenticatedDeviceOrFail(w, r, logger)
@@ -108,7 +106,12 @@ func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 }
 
 // handlePushChanges applies a batch of client changes.
-func handlePushChanges(pool *pgxpool.Pool, logger *slog.Logger, replayWindow time.Duration) http.HandlerFunc {
+func handlePushChanges(
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+	replayWindow time.Duration,
+	changeEvents *changefeed.Broker,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		caller, ok := authenticatedDeviceOrFail(w, r, logger)
 		if !ok {
@@ -133,7 +136,7 @@ func handlePushChanges(pool *pgxpool.Pool, logger *slog.Logger, replayWindow tim
 			return
 		}
 
-		response, err := syncengine.ApplyChangeBatch(r.Context(), pool, syncengine.PushRequest{
+		response, committed, err := syncengine.ApplyChangeBatch(r.Context(), pool, syncengine.PushRequest{
 			Caller:       caller,
 			BatchID:      request.BatchID,
 			Changes:      request.Changes,
@@ -142,6 +145,11 @@ func handlePushChanges(pool *pgxpool.Pool, logger *slog.Logger, replayWindow tim
 		if err != nil {
 			writeInternalError(w, logger, "applying a change batch failed", err)
 			return
+		}
+		if committed {
+			// Publish only after Commit returned. The author already has the local content plus the
+			// authoritative versions in this response; its stream must not echo the same write.
+			changeEvents.Publish(caller.AccountID, caller.DeviceID)
 		}
 
 		// Decoded back only to log counts. The response itself is passed through as the bytes the

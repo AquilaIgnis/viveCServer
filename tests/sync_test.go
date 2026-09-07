@@ -1,18 +1,211 @@
 package tests
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/AquilaIgnis/viveCServer/internal/syncengine"
 )
+
+// TestChangeStreamDeliversContentOnlyToPeers proves the HTTP wiring, commit boundary, author
+// exclusion, and idempotent-replay suppression together. The peer receives the authoritative delta
+// in the stream itself; it makes no cursor or pull request after the push.
+func TestChangeStreamDeliversContentOnlyToPeers(t *testing.T) {
+	fixture := newSyncFixture(t)
+	tablet := fixture.registerDevice("tablet")
+	phone := fixture.registerDevice("phone")
+
+	tabletStream := openChangeStream(t, tablet)
+	defer tabletStream.close()
+	phoneStream := openChangeStream(t, phone)
+	defer phoneStream.close()
+	if event := tabletStream.read(t); event != "ready" {
+		t.Fatalf("tablet's first stream event = %q, want ready", event)
+	}
+	if event := phoneStream.read(t); event != "ready" {
+		t.Fatalf("phone's first stream event = %q, want ready", event)
+	}
+
+	batchID := newBatchID(t)
+	created := tablet.pushBatch(batchID, notebookChange("notebook-stream", 0, "Streamed"))
+	if len(created.Applied) != 1 {
+		t.Fatalf("push applied %+v, want one change", created.Applied)
+	}
+	event := phoneStream.readFrame(t)
+	if event.name != "changes" {
+		t.Fatalf("peer stream event = %q, want changes", event.name)
+	}
+	var streamed syncengine.PullResult
+	if err := json.Unmarshal(event.data, &streamed); err != nil {
+		t.Fatalf("decoding streamed delta: %v", err)
+	}
+	if len(streamed.Changes) != 1 || streamed.Cursor != created.Cursor || streamed.HasMore {
+		t.Fatalf("streamed delta = %+v, want the committed notebook through cursor %d", streamed, created.Cursor)
+	}
+	if got := decodeChangeObject(t, streamed.Changes[0])["id"]; got != "notebook-stream" {
+		t.Fatalf("streamed id = %v, want notebook-stream", got)
+	}
+	if event, arrived := tabletStream.tryRead(); arrived {
+		t.Fatalf("author stream received %q", event)
+	}
+
+	// The exact batch is replayed from applied_batches, not committed again, so it must not wake
+	// the peer a second time even though the HTTP response still lists its original applied row.
+	tablet.pushBatch(batchID, notebookChange("notebook-stream", 0, "Streamed"))
+	if event, arrived := phoneStream.tryRead(); arrived {
+		t.Fatalf("idempotent replay emitted %q", event)
+	}
+}
+
+func TestRevokingADeviceEndsItsAuthenticatedStream(t *testing.T) {
+	fixture := newSyncFixture(t)
+	tablet := fixture.registerDevice("tablet")
+	phone := fixture.registerDevice("phone")
+	phoneStream := openChangeStream(t, phone)
+	defer phoneStream.close()
+	if event := phoneStream.read(t); event != "ready" {
+		t.Fatalf("phone's first stream event = %q, want ready", event)
+	}
+
+	status := fixture.request(http.MethodDelete, "/v1/devices/"+phone.deviceID, tablet.token, nil, nil)
+	if status != http.StatusNoContent {
+		t.Fatalf("revoking phone returned %d, want 204", status)
+	}
+	if event := phoneStream.read(t); event != "revoked" {
+		t.Fatalf("revoked phone stream event = %q, want revoked", event)
+	}
+}
+
+func TestChangeStreamReadyCarriesReconnectBacklog(t *testing.T) {
+	fixture := newSyncFixture(t)
+	writer := fixture.registerDevice("writer")
+	reader := fixture.registerDevice("reader")
+	created := writer.push(notebookChange("offline-change", 0, "Arrived while away"))
+
+	stream := openChangeStreamAt(t, reader, 0)
+	defer stream.close()
+	ready := stream.readFrame(t)
+	if ready.name != "ready" {
+		t.Fatalf("first stream event = %q, want ready", ready.name)
+	}
+	var backlog syncengine.PullResult
+	if err := json.Unmarshal(ready.data, &backlog); err != nil {
+		t.Fatalf("decoding ready backlog: %v", err)
+	}
+	if len(backlog.Changes) != 1 || backlog.Cursor != created.Cursor {
+		t.Fatalf("ready backlog = %+v, want one change through cursor %d", backlog, created.Cursor)
+	}
+}
+
+type testChangeStream struct {
+	cancel context.CancelFunc
+	body   io.ReadCloser
+	reader *bufio.Reader
+}
+
+type changeStreamFrame struct {
+	name string
+	data []byte
+}
+
+func openChangeStream(t *testing.T, device *deviceClient) *testChangeStream {
+	return openChangeStreamAt(t, device, 0)
+}
+
+func openChangeStreamAt(t *testing.T, device *deviceClient, since int64) *testChangeStream {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("%s/v1/changes/watch?since=%d", device.fixture.baseURL, since),
+		nil,
+	)
+	if err != nil {
+		cancel()
+		t.Fatalf("building change stream request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+device.token)
+	request.Header.Set("Accept", "text/event-stream")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		cancel()
+		t.Fatalf("opening change stream: %v", err)
+	}
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" {
+		response.Body.Close()
+		cancel()
+		t.Fatalf("change stream answered %d %q", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+	return &testChangeStream{cancel: cancel, body: response.Body, reader: bufio.NewReader(response.Body)}
+}
+
+func (stream *testChangeStream) close() {
+	stream.cancel()
+	_ = stream.body.Close()
+}
+
+func (stream *testChangeStream) read(t *testing.T) string {
+	return stream.readFrame(t).name
+}
+
+func (stream *testChangeStream) readFrame(t *testing.T) changeStreamFrame {
+	t.Helper()
+	event, err := readChangeStreamEvent(stream.reader)
+	if err != nil {
+		t.Fatalf("reading change stream: %v", err)
+	}
+	return event
+}
+
+func (stream *testChangeStream) tryRead() (string, bool) {
+	result := make(chan string, 1)
+	go func() {
+		event, _ := readChangeStreamEvent(stream.reader)
+		result <- event.name
+	}()
+	select {
+	case event := <-result:
+		return event, true
+	case <-time.After(100 * time.Millisecond):
+		return "", false
+	}
+}
+
+func readChangeStreamEvent(reader *bufio.Reader) (changeStreamFrame, error) {
+	eventName := ""
+	data := make([]byte, 0)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return changeStreamFrame{}, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return changeStreamFrame{name: eventName, data: data}, nil
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		}
+		if strings.HasPrefix(line, "data:") {
+			if len(data) > 0 {
+				data = append(data, '\n')
+			}
+			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:"))...)
+		}
+	}
+}
 
 // TestTwoDevicesConvergeOnTheHierarchy is S2's exit criterion: two simulated clients converge on
 // notebooks, sections and pages, including a deletion.

@@ -18,10 +18,10 @@ var ErrDeviceNotFound = errors.New("no such device")
 // lastSeenRefreshInterval is how stale `devices.last_seen_at` is allowed to get before an
 // authenticated request refreshes it.
 //
-// Not updated on every request. Clients poll every 60 seconds (syncPlan.md SD6) and most of those
-// polls have nothing to do, so writing a row each time would turn the cheapest request the server
-// has into a write — and the plan commits to that poll staying nearly free. Five minutes keeps the
-// field useful for "when did this device last check in" while making the write rare.
+// Not updated on every request. A reconnect may be followed immediately by a cursor check and an
+// outbox push, so writing each one would turn one foreground transition into several database
+// writes. Five minutes keeps the field useful for "when did this device last check in" while
+// making the write rare.
 const lastSeenRefreshInterval = 5 * time.Minute
 
 // Device is one registered client.

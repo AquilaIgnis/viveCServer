@@ -30,8 +30,8 @@ func compressionTestHandler(body []byte) http.Handler {
 	})
 }
 
-// TestASmallResponseIsNotCompressed guards the request this server makes most often. The idle poll
-// answers twelve bytes, and gzip's own framing is larger than that.
+// TestASmallResponseIsNotCompressed guards the cursor catch-up. It answers twelve bytes, and gzip's
+// own framing is larger than that.
 func TestASmallResponseIsNotCompressed(t *testing.T) {
 	handler := withCompression(compressionTestHandler([]byte(`{"cursor":4}`)), discardLogger())
 

@@ -9,9 +9,8 @@ import (
 
 // gzipMinimumBytes is the response size below which compressing is a pessimisation.
 //
-// The idle poll answers `{"cursor":4}` in twelve bytes (SD6), and gzip's header, trailer and block
-// framing alone are more than that — compressing it would make the most frequent request this
-// server has bigger and slower. A response is therefore buffered until it passes roughly one
+// A cursor catch-up answers `{"cursor":4}` in twelve bytes, and gzip's header, trailer and block
+// framing alone are more than that. A response is therefore buffered until it passes roughly one
 // ethernet payload, and only then does the encoder start.
 const gzipMinimumBytes = 1400
 
@@ -25,9 +24,8 @@ const maxCompressedRequestBytes = 4 * 1024 * 1024
 
 // withCompression adds gzip in both directions (syncPlan.md §7).
 //
-// Deliberately wrapped around the sync handler alone. The admin surface streams its live log as
-// `text/event-stream`, and a compressor between that and the browser buffers the very thing whose
-// point is arriving immediately.
+// Deliberately wrapped around the sync handler alone. Event streams are explicitly bypassed below:
+// a compressor between an event and its reader buffers the very thing whose point is immediate.
 func withCompression(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Attachment bytes go past untouched, for three separate reasons that happen to agree.
@@ -38,6 +36,12 @@ func withCompression(next http.Handler, logger *slog.Logger) http.Handler {
 		// so it would quietly cost the `sendfile(2)` path that keeps a 32 MB download out of this
 		// process's memory entirely.
 		if strings.HasPrefix(r.URL.Path, blobPathPrefix) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// A compressor buffers the event stream whose whole purpose is immediate delivery. The
+		// events are a few bytes and never benefit from gzip anyway.
+		if r.URL.Path == "/v1/changes/watch" {
 			next.ServeHTTP(w, r)
 			return
 		}
