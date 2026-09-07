@@ -37,6 +37,7 @@ func main() {
 	// third verb is a line rather than a decision about where to put it.
 	subcommands := map[string]func([]string) error{
 		"create-account": runCreateAccount,
+		"set-email":      runSetEmail,
 		"set-password":   runSetPassword,
 	}
 	if len(os.Args) > 1 {
@@ -52,7 +53,7 @@ func main() {
 		// reach the server, and it takes none, so anything else is a mistake worth naming.
 		if !strings.HasPrefix(os.Args[1], "-") {
 			fmt.Fprintf(os.Stderr, "vivecserver: unknown command %q\n", os.Args[1])
-			fmt.Fprintln(os.Stderr, "commands: create-account, set-password")
+			fmt.Fprintln(os.Stderr, "commands: create-account, set-email, set-password")
 			fmt.Fprintln(os.Stderr, "with no command, the server runs and is configured from the environment")
 			os.Exit(2)
 		}

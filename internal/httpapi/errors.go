@@ -11,7 +11,6 @@ const (
 	codeInvalidRequest     = "invalid_request"
 	codeInvalidCredentials = "invalid_credentials"
 	codeSignupClosed       = "signup_closed"
-	codeEmailTaken         = "email_taken"
 	codeUnauthenticated    = "unauthenticated"
 	codeNotFound           = "not_found"
 	codePayloadTooLarge    = "payload_too_large"

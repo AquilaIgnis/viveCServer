@@ -27,9 +27,9 @@ const passwordEnvironmentVariable = "VIVE_ACCOUNT_PASSWORD"
 
 // runCreateAccount creates an account from the command line.
 //
-// Browser setup is the normal way to create the first account. This remains as an unattended and
-// recovery path, and can create another account without temporarily opening public registration.
-// Shipping it in the same binary means a self-hoster needs nothing else installed:
+// Browser setup is the normal way to create the account. This remains as an unattended fallback;
+// like browser setup, it refuses to create a second account. Shipping it in the same binary means
+// a self-hoster needs nothing else installed:
 //
 //	docker compose -f deploy/docker-compose.yml run --rm -T vivecserver create-account -email you@example.com
 func runCreateAccount(arguments []string) error {
@@ -93,9 +93,9 @@ func runCreateAccount(arguments []string) error {
 		return fmt.Errorf("hashing the password: %w", err)
 	}
 
-	accountID, err := store.CreateAccount(ctx, pool, email, passwordHash)
-	if errors.Is(err, store.ErrEmailTaken) {
-		return fmt.Errorf("an account already exists for %s", email)
+	accountID, err := store.CreateInitialAccount(ctx, pool, email, passwordHash)
+	if errors.Is(err, store.ErrEmailTaken) || errors.Is(err, store.ErrSetupAlreadyComplete) {
+		return errors.New("this community server already has its account")
 	}
 	if err != nil {
 		return err

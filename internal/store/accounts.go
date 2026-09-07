@@ -78,6 +78,26 @@ func FindAccountByEmail(ctx context.Context, pool *pgxpool.Pool, normalisedEmail
 	return account, nil
 }
 
+// UpdateAdminEmail replaces the address used to sign in to the community server's admin account.
+//
+// Account creation is first-account-only at every production entry point, so no old-address
+// selector is needed here. newEmail is expected to have passed auth.NormaliseEmail at the command
+// boundary.
+func UpdateAdminEmail(ctx context.Context, pool *pgxpool.Pool, newEmail string) error {
+	result, err := pool.Exec(ctx, `UPDATE accounts SET email = $1`, newEmail)
+	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == uniqueViolationCode {
+			return ErrEmailTaken
+		}
+		return fmt.Errorf("updating an account email: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrAccountNotFound
+	}
+	return nil
+}
+
 // CreateInitialAccount creates the first account, and only the first account.
 //
 // PostgreSQL's transaction-scoped advisory lock serialises competing setup requests. Counting and
@@ -108,6 +128,10 @@ func CreateInitialAccount(ctx context.Context, pool *pgxpool.Pool, normalisedEma
 		INSERT INTO accounts (email, password_hash)
 		VALUES ($1, $2)
 		RETURNING id::text`, normalisedEmail, passwordHash).Scan(&accountID); err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == uniqueViolationCode {
+			return "", ErrSetupAlreadyComplete
+		}
 		return "", fmt.Errorf("creating initial account: %w", err)
 	}
 

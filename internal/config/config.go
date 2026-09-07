@@ -25,9 +25,9 @@ const (
 	// else will use. Accounts are created with the `create-account` subcommand instead.
 	SignupModeClosed SignupMode = "closed"
 
-	// SignupModeOpen lets anyone register. Appropriate for a private network, and a deliberate
-	// decision on a server reachable from anywhere else: there is no rate limiting to pair it with,
-	// because a personal server has none (syncPlan.md §12 decision 1).
+	// SignupModeOpen lets the first account register over HTTP. Once that sole account exists the
+	// server refuses another, regardless of this setting. Appropriate only during setup on a
+	// private network; browser setup is the safer default path.
 	SignupModeOpen SignupMode = "open"
 )
 

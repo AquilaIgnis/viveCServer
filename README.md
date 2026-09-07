@@ -41,6 +41,13 @@ You will be prompted to enter a new one
 docker compose exec vivecserver /usr/local/bin/vivecserver set-password -email you@example.com
 ```
 
+## Change Admin Email
+
+```bash
+docker compose exec vivecserver /usr/local/bin/vivecserver  set-email -email new@example.com
+
+```
+
 # Dev
 
 > Refer to openapi.yml for server - client contract

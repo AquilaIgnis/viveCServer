@@ -51,12 +51,11 @@ func handleCreateAccount(pool *pgxpool.Pool, logger *slog.Logger, signupMode con
 			return
 		}
 
-		accountID, err := store.CreateAccount(r.Context(), pool, email, passwordHash)
-		if errors.Is(err, store.ErrEmailTaken) {
-			// This does confirm that an address is registered. Unavoidable on a registration
-			// endpoint — the alternative is accepting a duplicate and failing later — and it is
-			// why the default signup mode is closed.
-			writeError(w, logger, http.StatusConflict, codeEmailTaken, "an account already exists for that email address")
+		accountID, err := store.CreateInitialAccount(r.Context(), pool, email, passwordHash)
+		if errors.Is(err, store.ErrEmailTaken) || errors.Is(err, store.ErrSetupAlreadyComplete) {
+			// The community server has exactly one account. Keep this generic rather than saying
+			// whether the submitted address is the one it holds.
+			writeError(w, logger, http.StatusConflict, codeSignupClosed, "this server already has its account")
 			return
 		}
 		if err != nil {

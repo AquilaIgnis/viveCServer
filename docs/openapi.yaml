@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.7.0
+  version: 0.8.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -115,11 +115,13 @@ paths:
     post:
       operationId: createAccount
       tags: [Accounts]
-      summary: Create an account when public registration is enabled
+      summary: Create the sole account when public registration is enabled
       description: |
         This endpoint returns `403 signup_closed` under the default `VIVE_SIGNUP_MODE=closed`
         configuration. Self-hosted users normally create the first account through the browser
-        setup wizard on port 8080, not through this operation.
+        setup wizard on port 8080, not through this operation. The server permits exactly one
+        account, so this operation returns `409 signup_closed` after that account exists even when
+        public registration remains enabled.
       security: []
       requestBody:
         required: true
@@ -149,14 +151,14 @@ paths:
                 error: signup_closed
                 message: this server does not accept registrations; the operator creates accounts with the create-account command
         "409":
-          description: An account already uses the submitted email address.
+          description: The server already has its sole account.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
-                error: email_taken
-                message: an account already exists for that email address
+                error: signup_closed
+                message: this server already has its account
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "500":
@@ -1593,7 +1595,6 @@ components:
         - invalid_request
         - invalid_credentials
         - signup_closed
-        - email_taken
         - unauthenticated
         - not_found
         - payload_too_large
