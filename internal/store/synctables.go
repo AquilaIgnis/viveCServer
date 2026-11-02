@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
 	"reflect"
 	"strings"
 	"time"
@@ -685,9 +686,10 @@ func FindAppliedBatchResponse(
 // RecordAppliedBatchResponse stores what a push answered, so a retry of the same batch id replays
 // it instead of applying the work twice.
 //
-// Expired rows for the same device are removed in the same statement pair rather than by a
-// background job: the set is small, the delete is indexed by the primary key's leading column, and
-// a sweeper is one more thing that can be forgotten in a self-hosted deployment.
+// Expired rows for the same device are removed here rather than by a background job: the set is
+// small, the delete is indexed by the primary key's leading column, and a sweeper is one more thing
+// that can be forgotten in a self-hosted deployment. Only on a sample of pushes, though — see
+// [batchPruneSampleRate].
 func RecordAppliedBatchResponse(
 	ctx context.Context,
 	transaction pgx.Tx,
@@ -705,6 +707,10 @@ func RecordAppliedBatchResponse(
 		return fmt.Errorf("recording a batch response: %w", err)
 	}
 
+	if !shouldPruneBatchResponses() {
+		return nil
+	}
+
 	const pruneStatement = `
 		DELETE FROM applied_batches
 		WHERE device_id = $1::uuid AND created_at < now() - $2::interval`
@@ -713,6 +719,21 @@ func RecordAppliedBatchResponse(
 		return fmt.Errorf("pruning batch responses: %w", err)
 	}
 	return nil
+}
+
+// batchPruneSampleRate is how often recording a batch response also prunes the expired ones.
+//
+// The delete is a sequential round trip inside the push transaction, and on almost every push it
+// finds nothing: a device's rows only expire one replay window after they were written. Sampling
+// keeps it off the common path. Rows it leaves behind for a while are invisible to the replay
+// lookup, which already requires created_at > now() - interval, so a late prune changes disk use and
+// nothing else.
+const batchPruneSampleRate = 32
+
+// shouldPruneBatchResponses samples the housekeeping delete. Random rather than a counter, which
+// would be one more piece of state shared between requests.
+func shouldPruneBatchResponses() bool {
+	return rand.IntN(batchPruneSampleRate) == 0
 }
 
 // RecordAcknowledgedSeq stores the highest cursor a device has presented as `since` on a later
