@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AquilaIgnis/viveCServer/internal/auth"
@@ -131,7 +132,7 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 
 			if kind.ParentKind != "" {
 				parentID := change.fields.ParentID()
-				_, storedParent := batchContext.parentIDs[parentID]
+				_, storedParent := batchContext.ExistingParentIDs[parentID]
 				_, parentInThisBatch := acceptedIDsByKind[kind.ParentKind][parentID]
 				if !storedParent && !parentInThisBatch {
 					rejected = append(rejected, RejectedChange{
@@ -153,7 +154,7 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 			// swept is exactly how a picture stops existing, and refusing that delete would leave a
 			// row the client can never retract.
 			if change.envelope.DeletedAt == nil && len(change.requiredBlobs) > 0 {
-				if missing := missingDigests(change.requiredBlobs, batchContext.storedBlobs); len(missing) > 0 {
+				if missing := missingDigests(change.requiredBlobs, batchContext.StoredBlobs); len(missing) > 0 {
 					rejected = append(rejected, RejectedChange{
 						Kind:    kind.Name,
 						ID:      change.envelope.ID,
@@ -164,7 +165,7 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 				}
 
 				if checker, checksBlobs := change.fields.(store.BlobConsistencyChecker); checksBlobs {
-					if err := checker.CheckBlobPresence(change.envelope.ID, batchContext.storedBlobs); err != nil {
+					if err := checker.CheckBlobPresence(change.envelope.ID, batchContext.StoredBlobs); err != nil {
 						rejected = append(rejected, RejectedChange{
 							Kind:    kind.Name,
 							ID:      change.envelope.ID,
@@ -181,8 +182,8 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 			// baseVersion is a conflict with no current state to send back, and the client's answer
 			// to that is to re-push at baseVersion 0 — which would create the notebook again. The
 			// device that was offline when the operator pressed Permanently delete would then be the
-			// one device able to undo it. See store.SelectPurgedIDs.
-			if _, retired := batchContext.purgedIDs[change.envelope.ID]; retired {
+			// one device able to undo it. See [store.ChangeContext.PurgedIDs].
+			if _, retired := batchContext.PurgedIDs[change.envelope.ID]; retired {
 				rejected = append(rejected, RejectedChange{
 					Kind:    kind.Name,
 					ID:      change.envelope.ID,
@@ -192,7 +193,7 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 				continue
 			}
 
-			current, storedHere := batchContext.currentByID[change.envelope.ID]
+			current, storedHere := batchContext.CurrentByID[change.envelope.ID]
 			switch {
 			case storedHere && current.Version != change.baseVersion:
 				// The entity moved on since the client last saw it. The current row travels with
@@ -296,34 +297,18 @@ func ApplyChangeBatch(ctx context.Context, pool *pgxpool.Pool, request PushReque
 	return response, len(pendingWrites) > 0, nil
 }
 
-// batchContext is everything one kind's run needs from the database, read once for the whole run.
-type batchContext struct {
-	// currentByID holds the stored rows the run is editing, for the version check.
-	currentByID map[string]store.CurrentChange
-
-	// parentIDs is which of the parents the run names already exist.
-	parentIDs map[string]struct{}
-
-	// storedBlobs is which of the attachment digests the run references are held by this account,
-	// and how large each one is.
-	storedBlobs map[string]store.BlobPresence
-
-	// purgedIDs is which of the run's own ids this account has erased for good and will never
-	// store anything under again.
-	purgedIDs map[string]struct{}
-}
-
-// readBatchContext fetches all of that in at most four queries.
+// readBatchContext gathers what one kind's run needs and asks for all of it at once.
 //
-// Four rather than four per entity: a push carries up to 512 changes, and a round trip each would
-// make the checks cost more than the writes they guard. Each query takes the run's ids as an array.
+// Four questions rather than four per entity: a push carries up to 512 changes, and a round trip
+// each would cost more than the writes they guard. [store.ReadChangeContext] pipelines them, since
+// nothing here depends on anything else here.
 func readBatchContext(
 	ctx context.Context,
-	database store.Querier,
+	transaction pgx.Tx,
 	accountID string,
 	kind *store.SyncKind,
 	run []decodedChange,
-) (batchContext, error) {
+) (store.ChangeContext, error) {
 	entityIDs := make([]string, 0, len(run))
 	parentIDs := make([]string, 0, len(run))
 	requiredDigests := make([]string, 0)
@@ -350,42 +335,18 @@ func readBatchContext(
 		}
 	}
 
-	currentByID, err := store.SelectCurrentChanges(ctx, database, kind, accountID, entityIDs)
-	if err != nil {
-		return batchContext{}, err
-	}
-
-	existingParentIDs := map[string]struct{}{}
+	var parentKind *store.SyncKind
 	if kind.ParentKind != "" {
-		parentKind, known := store.SyncKindByName(kind.ParentKind)
+		resolved, known := store.SyncKindByName(kind.ParentKind)
 		if !known {
-			return batchContext{}, fmt.Errorf("kind %q names an unregistered parent kind %q", kind.Name, kind.ParentKind)
+			return store.ChangeContext{}, fmt.Errorf("kind %q names an unregistered parent kind %q", kind.Name, kind.ParentKind)
 		}
-		existingParentIDs, err = store.SelectExistingIDs(ctx, database, parentKind, accountID, parentIDs)
-		if err != nil {
-			return batchContext{}, err
-		}
+		parentKind = resolved
 	}
 
-	storedBlobs, err := store.SelectStoredBlobs(ctx, database, accountID, requiredDigests)
-	if err != nil {
-		return batchContext{}, err
-	}
-
-	// Asked for every kind rather than only for the one kind permanent deletion writes today. The
-	// log names a kind for exactly this reason, and a check that knew which kinds could appear in it
-	// would be a second copy of that answer, kept level by hand.
-	purgedIDs, err := store.SelectPurgedIDs(ctx, database, accountID, kind.Name, entityIDs)
-	if err != nil {
-		return batchContext{}, err
-	}
-
-	return batchContext{
-		currentByID: currentByID,
-		parentIDs:   existingParentIDs,
-		storedBlobs: storedBlobs,
-		purgedIDs:   purgedIDs,
-	}, nil
+	return store.ReadChangeContext(
+		ctx, transaction, kind, parentKind, accountID, entityIDs, parentIDs, requiredDigests,
+	)
 }
 
 // missingDigests reports which of an entity's required blobs this account does not hold.
@@ -455,6 +416,16 @@ func PullChanges(
 // let a push commit between the two reads, and the cursor returned would sit above rows the client
 // never received — which is the same lost-update the advisory lock exists to prevent, reintroduced
 // on the read side.
+//
+// Two queries, and the cheap one decides what the expensive one reads: the first finds the sequence
+// this page ends at from row counts and size estimates, the second renders exactly that range. See
+// [store.SelectDeltaCutoff]. Because the boundary is what comes back, there is no over-read by one
+// row, no truncation to a sequence boundary, and no second query for an oversized push.
+//
+// The two queries run in separate snapshots, which is safe because rows only ever leave a range
+// that is already below the cursor: a write gives its row a sequence above upperBound. A row that
+// moved between the two reads is missing from this page and delivered at its new sequence by the
+// next one, which is also what a single-query read taken a moment later would have returned.
 func selectChangePage(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -467,62 +438,70 @@ func selectChangePage(
 		return PullResult{}, err
 	}
 
-	empty := PullResult{Changes: make([]json.RawMessage, 0), Cursor: upperBound, HasMore: false}
+	caughtUp := PullResult{Changes: make([]json.RawMessage, 0), Cursor: upperBound, HasMore: false}
 	if sinceCursor >= upperBound {
 		// Includes the client that is ahead of the server, which a restore from backup can produce.
 		// S6 turns that case into `410 cursor_expired` and a full reconcile; until the client can
 		// act on it, the honest cursor is more useful than an error it would only log.
-		return empty, nil
+		return caughtUp, nil
 	}
 
-	// One row past the limit, purely to learn whether there are more.
-	delta, stoppedForBytes, err := store.SelectDelta(ctx, pool, accountID, sinceCursor, upperBound, limit+1)
+	cutoff, err := store.SelectDeltaCutoff(
+		ctx, pool, accountID, sinceCursor, upperBound, limit, store.MaxDeltaBytes,
+	)
 	if err != nil {
 		return PullResult{}, err
 	}
-	if len(delta) <= limit && !stoppedForBytes {
-		return PullResult{Changes: changesOf(delta), Cursor: upperBound, HasMore: false}, nil
-	}
-	if len(delta) <= limit {
-		// Fewer rows than the client asked for, and still not everything: the delta ran into the
-		// byte budget instead. It already ends where a sequence value does, so the last one read is
-		// the cursor and the client comes back for the rest.
-		cursor := delta[len(delta)-1].ChangeSeq
-		return PullResult{Changes: changesOf(delta), Cursor: cursor, HasMore: cursor < upperBound}, nil
+	if cutoff.Empty {
+		// Sequence values the account allocated but this range has no rows for — every row of a
+		// permanently deleted notebook, say. Returning the account's own value rather than a row's
+		// is what stops the client asking again for a gap that will never have anything in it.
+		return caughtUp, nil
 	}
 
-	// There is more than one page of delta, so the response has to stop at a sequence boundary. A
-	// batch is atomic across kinds (SD2) — a page and the section it was moved into are stamped with
-	// one value — so a cursor that landed inside a sequence value would let a client acknowledge
-	// half of a push and never see the other half.
-	overflowSeq := delta[limit].ChangeSeq
-	truncated := delta[:limit]
-	for len(truncated) > 0 && truncated[len(truncated)-1].ChangeSeq == overflowSeq {
-		truncated = truncated[:len(truncated)-1]
+	// Complete means nothing was held back, so the page reaches the bound the caller asked about
+	// and the cursor is that bound rather than the last row's sequence — for the same reason.
+	pageEnd := cutoff.Sequence
+	if cutoff.Complete {
+		pageEnd = upperBound
 	}
 
-	if len(truncated) == 0 {
-		// A single push is larger than the page the client asked for. Returning it whole is the
-		// only answer that lets the client advance at all, which makes `limit` a request rather
-		// than a cap. It is bounded by the push limit, not by the client's number.
-		wholeSequence, _, err := store.SelectDelta(ctx, pool, accountID, overflowSeq-1, overflowSeq, MaxChangesPerBatch+1)
-		if err != nil {
-			return PullResult{}, err
-		}
-		if len(wholeSequence) > MaxChangesPerBatch {
-			// Unreachable while pushes are capped at MaxChangesPerBatch. Failing here is the
-			// alternative to returning part of a sequence value and calling it complete.
-			return PullResult{}, fmt.Errorf("change sequence %d holds more than %d entities", overflowSeq, MaxChangesPerBatch)
-		}
-		return PullResult{
-			Changes: changesOf(wholeSequence),
-			Cursor:  overflowSeq,
-			HasMore: overflowSeq < upperBound,
-		}, nil
+	delta, bytesRead, err := store.SelectDelta(ctx, pool, accountID, sinceCursor, pageEnd)
+	if err != nil {
+		return PullResult{}, err
+	}
+	if err := checkDeltaWithinBudget(delta, bytesRead); err != nil {
+		return PullResult{}, err
 	}
 
-	cursor := truncated[len(truncated)-1].ChangeSeq
-	return PullResult{Changes: changesOf(truncated), Cursor: cursor, HasMore: cursor < upperBound}, nil
+	return PullResult{
+		Changes: changesOf(delta),
+		Cursor:  pageEnd,
+		HasMore: pageEnd < upperBound,
+	}, nil
+}
+
+// checkDeltaWithinBudget holds the boundary query to its promise.
+//
+// A page spanning more than one sequence value is one [store.SelectDeltaCutoff] chose the size of,
+// so a large overrun means its estimates no longer describe what the render produces — what happens
+// when a kind gains a column and only its changeJSON is updated. Failing here makes that one loud
+// error rather than responses nothing bounds.
+//
+// A single-sequence page is exempt at any size: a sequence is atomic across kinds, so a push larger
+// than the requested page is returned whole or the account can never pull past it.
+func checkDeltaWithinBudget(delta []store.DeltaRow, bytesRead int) error {
+	const ceiling = store.MaxDeltaBytes * store.DeltaBytesOverrunFactor
+	if bytesRead <= ceiling || len(delta) == 0 {
+		return nil
+	}
+	if delta[0].ChangeSeq == delta[len(delta)-1].ChangeSeq {
+		return nil
+	}
+	return fmt.Errorf(
+		"a delta page spanning sequences %d to %d rendered %d bytes, past the %d ceiling: a kind's byteWeight no longer matches its changeJSON",
+		delta[0].ChangeSeq, delta[len(delta)-1].ChangeSeq, bytesRead, ceiling,
+	)
 }
 
 func changesOf(delta []store.DeltaRow) []json.RawMessage {

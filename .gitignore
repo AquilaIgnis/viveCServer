@@ -2,7 +2,7 @@ memory
 viveNotes
 .env
 deploy/data/
-
+todo.txt
 
 # Locally built binary
 /vivecserver

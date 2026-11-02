@@ -105,6 +105,22 @@ const pageContentChangeJSON = `extra || jsonb_build_object(
 			  AND reference.page_id = page_content.page_id
 		), '[]'::jsonb))`
 
+// pageContentByteWeight estimates the size of [pageContentChangeJSON]'s output.
+//
+// `doc` travels base64-encoded, so its contribution is the encoded length — four characters per
+// three bytes, rounded up. octet_length reads that from the value's header without detoasting it,
+// which is what makes this affordable for every row of a delta.
+const pageContentByteWeight = changeEnvelopeBytes + ` + 130
+		+ octet_length(page_id)
+		+ ((octet_length(doc) + 2) / 3) * 4
+		+ 44
+		+ COALESCE((
+			SELECT count(*) * 70
+			FROM page_blob_refs AS reference
+			WHERE reference.account_id = page_content.account_id
+			  AND reference.page_id = page_content.page_id
+		), 0)`
+
 func (fields *PageContentFields) ParentID() string {
 	return fields.PageID
 }

@@ -25,6 +25,10 @@ const pageChangeJSON = `extra || jsonb_build_object(
 		'preview', preview,
 		'createdAt', created_at)`
 
+// pageByteWeight estimates the size of [pageChangeJSON]'s output. `preview` is the large one: it is
+// bounded at maxPreviewChars, which is four kilobytes of text per page.
+const pageByteWeight = changeEnvelopeBytes + ` + 100 + octet_length(title) + octet_length(preview) + octet_length(section_id)`
+
 func (fields *PageFields) ParentID() string {
 	return fields.SectionID
 }

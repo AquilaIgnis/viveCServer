@@ -56,6 +56,10 @@ const attachmentChangeJSON = `extra || jsonb_build_object(
 		'byteCount', byte_count,
 		'createdAt', created_at)`
 
+// attachmentByteWeight estimates the size of [attachmentChangeJSON]'s output. An attachment row
+// carries no payload — the bytes live on disk — so it is a media type and four numbers.
+const attachmentByteWeight = changeEnvelopeBytes + ` + 130 + octet_length(mime_type)`
+
 // ParentID is empty: one picture can appear on several pages, so there is no page that owns it.
 // The app's own entity says the same thing — "Not tied to a page by a foreign key, deliberately."
 func (fields *AttachmentFields) ParentID() string { return "" }

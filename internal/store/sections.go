@@ -22,6 +22,9 @@ const sectionChangeJSON = `extra || jsonb_build_object(
 		'sortIndex', sort_index,
 		'createdAt', created_at)`
 
+// sectionByteWeight estimates the size of [sectionChangeJSON]'s output.
+const sectionByteWeight = changeEnvelopeBytes + ` + 100 + octet_length(name) + octet_length(notebook_id)`
+
 func (fields *SectionFields) ParentID() string {
 	return fields.NotebookID
 }

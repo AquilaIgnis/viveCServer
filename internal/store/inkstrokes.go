@@ -88,6 +88,14 @@ const inkStrokeChangeJSON = `extra || jsonb_build_object(
 		'createdAt', created_at,
 		'groupId', group_id)`
 
+// inkStrokeByteWeight estimates the size of [inkStrokeChangeJSON]'s output. A stroke is mostly its
+// base64 `points`; the rest is a fixed set of numbers and a short brush name.
+const inkStrokeByteWeight = changeEnvelopeBytes + ` + 260
+		+ octet_length(page_id)
+		+ octet_length(brush_family)
+		+ COALESCE(octet_length(group_id), 0)
+		+ ((octet_length(points) + 2) / 3) * 4`
+
 func (fields *InkStrokeFields) ParentID() string {
 	return fields.PageID
 }

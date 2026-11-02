@@ -85,6 +85,14 @@ const inkEraseChangeJSON = `extra || jsonb_build_object(
 		'createdAt', created_at,
 		'targetIds', to_jsonb(target_ids))`
 
+// inkEraseByteWeight estimates the size of [inkEraseChangeJSON]'s output. `targetIds` is the one
+// that can grow: an erase names every stroke it touched, and they travel with it by construction.
+const inkEraseByteWeight = changeEnvelopeBytes + ` + 150
+		+ octet_length(page_id)
+		+ octet_length(mode)
+		+ ((octet_length(points) + 2) / 3) * 4
+		+ COALESCE(array_length(target_ids, 1), 0) * 44`
+
 const inkMoveChangeJSON = `extra || jsonb_build_object(
 		'kind', 'inkMove',
 		'id', id,
@@ -103,6 +111,12 @@ const inkMoveChangeJSON = `extra || jsonb_build_object(
 		'enc', enc,
 		'createdAt', created_at,
 		'targetIds', to_jsonb(target_ids))`
+
+// inkMoveByteWeight estimates the size of [inkMoveChangeJSON]'s output.
+const inkMoveByteWeight = changeEnvelopeBytes + ` + 190
+		+ octet_length(page_id)
+		+ ((octet_length(points) + 2) / 3) * 4
+		+ COALESCE(array_length(target_ids, 1), 0) * 44`
 
 func (fields *InkEraseFields) ParentID() string {
 	return fields.PageID

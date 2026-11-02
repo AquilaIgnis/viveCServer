@@ -201,6 +201,27 @@ func newSyncFixtureOnStore(t *testing.T, existing *syncFixture) *syncFixture {
 	}
 }
 
+// rowsAtSequence counts every synced row the account stamped with one change sequence, across all
+// eight kinds. A pull page may deliver all of a sequence or none of it, so this is what "the page
+// did not split a sequence" is checked against.
+func (fixture *syncFixture) rowsAtSequence(sequence int64) int {
+	fixture.t.Helper()
+
+	total := 0
+	for _, table := range []string{
+		"notebooks", "sections", "pages", "page_content",
+		"ink_strokes", "ink_erases", "ink_moves", "attachments",
+	} {
+		var count int
+		query := "SELECT count(*) FROM " + table + " WHERE account_id = $1::uuid AND change_seq = $2"
+		if err := fixture.pool.QueryRow(context.Background(), query, fixture.accountID, sequence).Scan(&count); err != nil {
+			fixture.t.Fatalf("counting %s rows at sequence %d: %v", table, sequence, err)
+		}
+		total += count
+	}
+	return total
+}
+
 // accountStorageBytes is what the account is charged for its attachments, which is also what the
 // admin dashboard's storage tile reads.
 func (fixture *syncFixture) accountStorageBytes() int64 {

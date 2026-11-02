@@ -2,7 +2,7 @@
 #   docker build -f deploy/Dockerfile .
 # docker-compose.yml in this directory already does that.
 
-FROM golang:1.26 AS build
+FROM golang:1.27 AS build
 
 WORKDIR /src
 

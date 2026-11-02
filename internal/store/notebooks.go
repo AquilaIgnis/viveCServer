@@ -51,6 +51,10 @@ const notebookChangeJSON = `extra || jsonb_build_object(
 		'cloudOnlyAt', cloud_only_at,
 		'createdAt', created_at)`
 
+// notebookByteWeight estimates the size of [notebookChangeJSON]'s output, for the page-boundary
+// query in synctables.go. Only `name` varies; everything else is a number, a boolean or null.
+const notebookByteWeight = changeEnvelopeBytes + ` + 110 + octet_length(name)`
+
 // ParentID is empty: a notebook is the root of the hierarchy.
 func (fields *NotebookFields) ParentID() string {
 	return ""
@@ -114,7 +118,7 @@ type notebookShelf struct {
 // a live notebook at all.
 //
 // Reading it back out of JSON rather than selecting the columns again is what keeps the push path
-// at its three queries per kind (syncengine.readBatchContext). A row rendered by this build always
+// at one pipelined round trip per kind ([ReadChangeContext]). A row rendered by this build always
 // carries all three keys, so a missing or unreadable one means the value is genuinely absent.
 func notebookShelfOf(stored json.RawMessage) (shelf notebookShelf, hosted bool) {
 	if len(stored) == 0 {

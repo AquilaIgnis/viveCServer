@@ -92,44 +92,6 @@ func SelectPurges(ctx context.Context, database Querier, accountID string, since
 	return purges, nil
 }
 
-// SelectPurgedIDs reports which of a push's ids this account has erased for good.
-//
-// The gravestone half of the log. A device that was offline when the operator pressed Permanently
-// delete still holds the notebook, and if it also holds an unsent edit to it, its next push carries
-// that notebook — with a stale `baseVersion`, which the version check refuses, and then with
-// `baseVersion` 0, which the version check has nothing to say about. That second push would create
-// the notebook again, and the account would receive its erased notebook back from the one device
-// that had not heard the news. So the id is retired: nothing may be stored under it again.
-func SelectPurgedIDs(ctx context.Context, database Querier, accountID string, kind string, entityIDs []string) (map[string]struct{}, error) {
-	purged := make(map[string]struct{})
-	if len(entityIDs) == 0 {
-		return purged, nil
-	}
-
-	const statement = `
-		SELECT entity_id
-		FROM purges
-		WHERE account_id = $1::uuid AND kind = $2 AND entity_id = ANY($3::text[])`
-
-	rows, err := database.Query(ctx, statement, accountID, kind, entityIDs)
-	if err != nil {
-		return nil, fmt.Errorf("checking purged %s ids: %w", kind, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var entityID string
-		if err := rows.Scan(&entityID); err != nil {
-			return nil, fmt.Errorf("checking purged %s ids: %w", kind, err)
-		}
-		purged[entityID] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("checking purged %s ids: %w", kind, err)
-	}
-	return purged, nil
-}
-
 // PrunePurges drops the gravestones every active device has already pulled past.
 //
 // This is the condition that used to stand between the operator and the Permanently delete button.

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -79,6 +80,68 @@ func TestALargeResponseIsCompressedAndDecodesToTheSameBytes(t *testing.T) {
 	if !bytes.Equal(decoded, original) {
 		t.Fatal("the decompressed body is not what the handler wrote")
 	}
+}
+
+// TestConsecutiveResponsesEachDecodeOnTheirOwn: encoders are pooled, so a second response may be
+// written by the encoder that finished the first. One that kept any state between them would hand
+// the second client a stream that does not decode, or decodes to the first client's bytes.
+func TestConsecutiveResponsesEachDecodeOnTheirOwn(t *testing.T) {
+	for round := range 4 {
+		original := []byte(strings.Repeat(fmt.Sprintf(`{"kind":"page","round":%d},`, round), 300))
+		handler := withCompression(compressionTestHandler(original), discardLogger())
+
+		request := httptest.NewRequest(http.MethodGet, "/v1/changes", nil)
+		request.Header.Set("Accept-Encoding", "gzip")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if decoded := gunzipResponse(t, response); !bytes.Equal(decoded, original) {
+			t.Fatalf("round %d decoded to %d bytes that are not what its handler wrote", round, len(decoded))
+		}
+	}
+}
+
+// TestAResponseWrittenInSmallPiecesIsHeldThenCompressed covers the other path into the encoder: a
+// handler whose writes are each below the threshold, so the first ones are buffered and handed over
+// only once their total clears it.
+func TestAResponseWrittenInSmallPiecesIsHeldThenCompressed(t *testing.T) {
+	piece := []byte(`{"kind":"inkStroke","id":"stroke"},`)
+	var original []byte
+	handler := withCompression(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		for range 200 {
+			_, _ = w.Write(piece)
+		}
+	}), discardLogger())
+	for range 200 {
+		original = append(original, piece...)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/changes", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip once the pieces add up past the threshold",
+			response.Header().Get("Content-Encoding"))
+	}
+	if decoded := gunzipResponse(t, response); !bytes.Equal(decoded, original) {
+		t.Fatal("the decompressed body is not what the handler wrote")
+	}
+}
+
+func gunzipResponse(t *testing.T, response *httptest.ResponseRecorder) []byte {
+	t.Helper()
+	reader, err := gzip.NewReader(response.Body)
+	if err != nil {
+		t.Fatalf("response is not gzip: %v", err)
+	}
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("reading the compressed body: %v", err)
+	}
+	return decoded
 }
 
 func TestAClientThatCannotDecompressGetsPlainBytes(t *testing.T) {

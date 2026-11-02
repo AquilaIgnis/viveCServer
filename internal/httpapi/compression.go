@@ -2,9 +2,11 @@ package httpapi
 
 import (
 	"compress/gzip"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // gzipMinimumBytes is the response size below which compressing is a pessimisation.
@@ -21,6 +23,23 @@ const gzipMinimumBytes = 1400
 // before the decoder is no limit at all. This one exists so that a request which is nothing but
 // compressed padding is refused before it is decompressed rather than after.
 const maxCompressedRequestBytes = 4 * 1024 * 1024
+
+// gzipWriters recycles the encoders: gzip.NewWriter allocates a fresh deflate window and hash
+// tables, on the order of a couple of hundred kilobytes, and Reset reuses all of it.
+var gzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+
+func acquireGzipWriter(destination io.Writer) *gzip.Writer {
+	encoder := gzipWriters.Get().(*gzip.Writer)
+	encoder.Reset(destination)
+	return encoder
+}
+
+// releaseGzipWriter returns a finished encoder to the pool, Reset to io.Discard so a pooled encoder
+// never holds a reference to the response it was writing.
+func releaseGzipWriter(encoder *gzip.Writer) {
+	encoder.Reset(io.Discard)
+	gzipWriters.Put(encoder)
+}
 
 // withCompression adds gzip in both directions (syncPlan.md §7).
 //
@@ -112,6 +131,14 @@ func (w *gzipResponseWriter) Write(payload []byte) (int, error) {
 		return w.encoder.Write(payload)
 	}
 
+	// A write that already clears the threshold goes straight to the encoder. This is the ordinary
+	// case: writeJSON marshals a whole response and issues one Write, so buffering first would copy
+	// the entire body — eight megabytes for a delta at the page ceiling — only to drop the copy.
+	if len(w.buffered) == 0 && len(payload) >= gzipMinimumBytes {
+		w.commitCompressed()
+		return w.encoder.Write(payload)
+	}
+
 	w.buffered = append(w.buffered, payload...)
 	if len(w.buffered) < gzipMinimumBytes {
 		return len(payload), nil
@@ -143,6 +170,15 @@ func (w *gzipResponseWriter) Flush() {
 	}
 }
 
+// Unwrap exposes the real writer to http.ResponseController.
+//
+// Without it the controller cannot reach the connection's deadline methods through this wrapper and
+// answers ErrNotSupported silently. The routes that set deadlines are matched by path and never
+// reach the compressor, but that is a property of the bypass list rather than of this type.
+func (w *gzipResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (w *gzipResponseWriter) commitCompressed() {
 	w.committed = true
 	header := w.ResponseWriter.Header()
@@ -150,7 +186,7 @@ func (w *gzipResponseWriter) commitCompressed() {
 	// Written before compression and therefore describing the wrong body. Removing it lets the
 	// standard library size the response, or chunk it.
 	header.Del("Content-Length")
-	w.encoder = gzip.NewWriter(w.ResponseWriter)
+	w.encoder = acquireGzipWriter(w.ResponseWriter)
 	w.ResponseWriter.WriteHeader(w.statusOrOK())
 }
 
@@ -159,6 +195,8 @@ func (w *gzipResponseWriter) commitCompressed() {
 func (w *gzipResponseWriter) finish() {
 	if w.encoder != nil {
 		_ = w.encoder.Close()
+		releaseGzipWriter(w.encoder)
+		w.encoder = nil
 		return
 	}
 	if w.committed {

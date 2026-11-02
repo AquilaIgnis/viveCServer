@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AquilaIgnis/viveCServer/internal/store"
 	"github.com/AquilaIgnis/viveCServer/internal/syncengine"
 )
 
@@ -901,5 +902,180 @@ func TestADeviceCanBeRenamedAndARevokedOneCannot(t *testing.T) {
 	if status := fixture.request(http.MethodPatch, "/v1/devices/"+other.deviceID, tablet.token,
 		map[string]any{"name": "Renamed after the fact"}, nil); status != http.StatusNotFound {
 		t.Fatalf("renaming a revoked device = %d, want 404", status)
+	}
+}
+
+// A full reconcile has to hand a device every row exactly once, and each page has to end where a
+// change sequence does. A sequence is atomic across kinds — a page and the section it moved into
+// are stamped with one value — so a page that stopped inside one would let a client commit a
+// cursor acknowledging half of a push and never ask for the other half.
+//
+// The paging is decided by a boundary query rather than by over-reading and truncating, which is
+// what makes this worth pinning: the properties are the same, and the code that produces them is
+// not the code that used to.
+func TestAFullReconcileDeliversEveryRowOnceOnSequenceBoundaries(t *testing.T) {
+	fixture := newSyncFixture(t)
+	author := fixture.registerDevice("author")
+
+	author.push(notebookChange("nb-reconcile", 0, "Reconcile"))
+	author.push(sectionChange("sec-reconcile", 0, "nb-reconcile", "Section"))
+	author.push(pageChange("page-reconcile", 0, "sec-reconcile", "Page"))
+
+	// Several pushes, each its own sequence value, each holding more rows than the page size below.
+	const pushes = 6
+	const strokesPerPush = 9
+	expected := make(map[string]int)
+	strokePoints := bytes.Repeat([]byte{0x41}, 512)
+	for push := range pushes {
+		changes := make([]map[string]any, 0, strokesPerPush)
+		for stroke := range strokesPerPush {
+			id := fmt.Sprintf("stroke-%d-%d", push, stroke)
+			changes = append(changes, inkStrokeChange(id, 0, "page-reconcile", push*strokesPerPush+stroke, strokePoints))
+			expected[id] = 0
+		}
+		author.push(changes...)
+	}
+	expected["nb-reconcile"] = 0
+	expected["sec-reconcile"] = 0
+	expected["page-reconcile"] = 0
+
+	reader := fixture.registerDevice("reader")
+
+	// A limit well below one push, so the "a sequence is larger than the page you asked for" path is
+	// the ordinary case here rather than an edge one.
+	const pageLimit = 4
+	cursor := int64(0)
+	pages := 0
+	seenAt := make(map[string]int)
+	lastCursor := int64(-1)
+	for {
+		page := reader.pull(cursor, pageLimit)
+		pages++
+		if pages > 50 {
+			t.Fatal("reconcile did not finish within 50 pages")
+		}
+		assertPageHoldsWholeSequences(t, fixture, pages, page)
+
+		for _, raw := range page.Changes {
+			id, _ := decodeChangeObject(t, raw)["id"].(string)
+			if _, known := expected[id]; !known {
+				t.Fatalf("page %d returned an unexpected id %q", pages, id)
+			}
+			if firstPage, repeated := seenAt[id]; repeated {
+				t.Fatalf("%q was delivered on page %d and again on page %d", id, firstPage, pages)
+			}
+			seenAt[id] = pages
+		}
+
+		if page.Cursor <= lastCursor {
+			t.Fatalf("page %d did not advance the cursor past %d", pages, lastCursor)
+		}
+		lastCursor = page.Cursor
+		cursor = page.Cursor
+		if !page.HasMore {
+			break
+		}
+	}
+
+	if pages < 3 {
+		t.Fatalf("reconcile took %d pages; the fixture is meant to need several", pages)
+	}
+	if len(seenAt) != len(expected) {
+		t.Fatalf("reconcile delivered %d rows, want %d", len(seenAt), len(expected))
+	}
+	if cursor != reader.cursor() {
+		t.Fatalf("final reconcile cursor = %d, want the account's %d", cursor, reader.cursor())
+	}
+
+	// Caught up: asking again returns nothing and does not move the cursor backwards.
+	settled := reader.pull(cursor, pageLimit)
+	if len(settled.Changes) != 0 || settled.HasMore || settled.Cursor != cursor {
+		t.Fatalf("a caught-up pull = %d changes, hasMore %t, cursor %d; want 0, false, %d",
+			len(settled.Changes), settled.HasMore, settled.Cursor, cursor)
+	}
+}
+
+// The byte budget is spent from size estimates before anything is rendered, so it needs its own
+// proof: a page of large documents has to stop under the budget, between two sequences, while the
+// row limit is nowhere near reached.
+func TestAPullPageStopsAtTheByteBudgetBetweenSequences(t *testing.T) {
+	fixture := newSyncFixture(t)
+	author := fixture.registerDevice("author")
+
+	author.push(notebookChange("nb-budget", 0, "Budget"))
+	author.push(sectionChange("sec-budget", 0, "nb-budget", "Section"))
+
+	// 900 KiB of document per push renders as about 1.2 MB of base64, so ten pushes are well past
+	// one page's budget and each one is far below it.
+	const pushes = 10
+	// Keyed by kind as well as id: a page's body carries the page's own id.
+	expected := map[string]struct{}{"notebook/nb-budget": {}, "section/sec-budget": {}}
+	for push := range pushes {
+		pageID := fmt.Sprintf("page-budget-%d", push)
+		doc := bytes.Repeat([]byte{byte('a' + push)}, 900<<10)
+		author.push(pageChange(pageID, 0, "sec-budget", pageID), pageContentChange(pageID, 0, doc))
+		expected["page/"+pageID] = struct{}{}
+		expected["pageContent/"+pageID] = struct{}{}
+	}
+
+	reader := fixture.registerDevice("reader")
+	const generousRowLimit = 2048
+
+	first := reader.pull(0, generousRowLimit)
+	if !first.HasMore {
+		t.Fatalf("the first page held all %d changes; the fixture is meant to need more than one page", len(first.Changes))
+	}
+	renderedBytes := 0
+	for _, raw := range first.Changes {
+		renderedBytes += len(raw)
+	}
+	if renderedBytes > store.MaxDeltaBytes {
+		t.Fatalf("the first page rendered %d bytes, past the %d budget", renderedBytes, store.MaxDeltaBytes)
+	}
+	assertPageHoldsWholeSequences(t, fixture, 1, first)
+
+	delivered, cursor := reader.pullEverything(0, generousRowLimit)
+	if len(delivered) != len(expected) {
+		t.Fatalf("paging delivered %d changes, want %d", len(delivered), len(expected))
+	}
+	seen := make(map[string]struct{}, len(delivered))
+	for _, change := range delivered {
+		key := change["kind"].(string) + "/" + change["id"].(string)
+		if _, known := expected[key]; !known {
+			t.Fatalf("paging delivered an unexpected change %s", key)
+		}
+		if _, repeated := seen[key]; repeated {
+			t.Fatalf("paging delivered %s twice", key)
+		}
+		seen[key] = struct{}{}
+	}
+	if cursor != reader.cursor() {
+		t.Fatalf("paging stopped at cursor %d, want the account's %d", cursor, reader.cursor())
+	}
+}
+
+// assertPageHoldsWholeSequences checks that rows arrive in sequence order, none above the page's
+// own cursor, and that every sequence the page touched is delivered in full.
+func assertPageHoldsWholeSequences(t *testing.T, fixture *syncFixture, pageNumber int, page syncengine.PullResult) {
+	t.Helper()
+
+	deliveredAt := make(map[int64]int)
+	previousSeq := int64(0)
+	for _, raw := range page.Changes {
+		seq := int64(decodeChangeObject(t, raw)["seq"].(float64))
+		if seq < previousSeq {
+			t.Fatalf("page %d returned sequence %d after %d: rows are not in sequence order", pageNumber, seq, previousSeq)
+		}
+		previousSeq = seq
+		if seq > page.Cursor {
+			t.Fatalf("page %d returned a row at sequence %d above its own cursor %d", pageNumber, seq, page.Cursor)
+		}
+		deliveredAt[seq]++
+	}
+	for seq, delivered := range deliveredAt {
+		if stored := fixture.rowsAtSequence(seq); delivered != stored {
+			t.Fatalf("page %d delivered %d of sequence %d's %d rows: the page split a sequence",
+				pageNumber, delivered, seq, stored)
+		}
 	}
 }

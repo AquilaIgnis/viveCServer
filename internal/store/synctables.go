@@ -145,6 +145,12 @@ type SyncKind struct {
 	// identity or version the server assigned.
 	changeJSON string
 
+	// byteWeight estimates changeJSON's output size in SQL without rendering it, which is how
+	// [selectDeltaCutoffStatement] picks a page boundary. Every term reads a length from a value's
+	// header, never the value, so it costs a heap scan and no detoasting. Approximate by design;
+	// both directions of error are recoverable.
+	byteWeight string
+
 	newFields func() EntityFields
 
 	// fieldKeys is every JSON key the kind's own struct claims, derived once from its tags so that
@@ -186,6 +192,12 @@ func IsReservedChangeKey(jsonKey string) bool {
 	return reserved
 }
 
+// changeEnvelopeBytes is what a rendered change costs before any kind's own fields: braces,
+// envelope keys, the id, and stored unknown fields. `extra` uses pg_column_size, which reports
+// stored rather than rendered size, so it under-counts; the 16 KiB cap on unrecognised fields
+// bounds the error.
+const changeEnvelopeBytes = `120 + octet_length(id) + pg_column_size(extra)`
+
 // syncKinds is the registry, in apply order. Each kind is one entry here and one file beside this
 // one — which is what page_content (S3), the three ink kinds (S4) and attachment (S5) each turned
 // out to cost.
@@ -196,6 +208,7 @@ var syncKinds = []*SyncKind{
 		Table:      "notebooks",
 		ParentKind: "",
 		changeJSON: notebookChangeJSON,
+		byteWeight: notebookByteWeight,
 		newFields:  func() EntityFields { return &NotebookFields{} },
 	},
 	{
@@ -204,6 +217,7 @@ var syncKinds = []*SyncKind{
 		Table:      "sections",
 		ParentKind: "notebook",
 		changeJSON: sectionChangeJSON,
+		byteWeight: sectionByteWeight,
 		newFields:  func() EntityFields { return &SectionFields{} },
 	},
 	{
@@ -212,6 +226,7 @@ var syncKinds = []*SyncKind{
 		Table:      "pages",
 		ParentKind: "section",
 		changeJSON: pageChangeJSON,
+		byteWeight: pageByteWeight,
 		newFields:  func() EntityFields { return &PageFields{} },
 	},
 	{
@@ -220,6 +235,7 @@ var syncKinds = []*SyncKind{
 		Table:      "page_content",
 		ParentKind: "page",
 		changeJSON: pageContentChangeJSON,
+		byteWeight: pageContentByteWeight,
 		newFields:  func() EntityFields { return &PageContentFields{} },
 	},
 	// The three ink kinds hang from a page and never from each other. An erase names the strokes it
@@ -232,6 +248,7 @@ var syncKinds = []*SyncKind{
 		Table:      "ink_strokes",
 		ParentKind: "page",
 		changeJSON: inkStrokeChangeJSON,
+		byteWeight: inkStrokeByteWeight,
 		newFields:  func() EntityFields { return &InkStrokeFields{} },
 	},
 	{
@@ -240,6 +257,7 @@ var syncKinds = []*SyncKind{
 		Table:      "ink_erases",
 		ParentKind: "page",
 		changeJSON: inkEraseChangeJSON,
+		byteWeight: inkEraseByteWeight,
 		newFields:  func() EntityFields { return &InkEraseFields{} },
 	},
 	{
@@ -248,6 +266,7 @@ var syncKinds = []*SyncKind{
 		Table:      "ink_moves",
 		ParentKind: "page",
 		changeJSON: inkMoveChangeJSON,
+		byteWeight: inkMoveByteWeight,
 		newFields:  func() EntityFields { return &InkMoveFields{} },
 	},
 	// Attachments hang from nothing. One picture can appear on several pages, so there is no parent
@@ -261,6 +280,7 @@ var syncKinds = []*SyncKind{
 		Table:      "attachments",
 		ParentKind: "",
 		changeJSON: attachmentChangeJSON,
+		byteWeight: attachmentByteWeight,
 		newFields:  func() EntityFields { return &AttachmentFields{} },
 	},
 }
@@ -403,80 +423,6 @@ type CurrentChange struct {
 	Change json.RawMessage
 }
 
-// SelectCurrentChanges reads the stored rows behind a batch's ids, keyed by id.
-func SelectCurrentChanges(
-	ctx context.Context,
-	database Querier,
-	kind *SyncKind,
-	accountID string,
-	entityIDs []string,
-) (map[string]CurrentChange, error) {
-	current := make(map[string]CurrentChange, len(entityIDs))
-	if len(entityIDs) == 0 {
-		return current, nil
-	}
-
-	statement := `SELECT id, version, ` + kind.changeJSON +
-		` FROM ` + kind.Table + ` WHERE account_id = $1::uuid AND id = ANY($2::text[])`
-
-	rows, err := database.Query(ctx, statement, accountID, entityIDs)
-	if err != nil {
-		return nil, fmt.Errorf("reading current %s rows: %w", kind.Name, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var entityID string
-		var stored CurrentChange
-		if err := rows.Scan(&entityID, &stored.Version, &stored.Change); err != nil {
-			return nil, fmt.Errorf("reading current %s rows: %w", kind.Name, err)
-		}
-		current[entityID] = stored
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("reading current %s rows: %w", kind.Name, err)
-	}
-	return current, nil
-}
-
-// SelectExistingIDs reports which of the given ids the account already has rows for.
-//
-// Used for the parent check. Existence is the question, not liveness: a tombstoned parent is still
-// a row, the foreign key is still satisfied, and what a deleted subtree means is the client's
-// decision rather than this server's.
-func SelectExistingIDs(
-	ctx context.Context,
-	database Querier,
-	kind *SyncKind,
-	accountID string,
-	entityIDs []string,
-) (map[string]struct{}, error) {
-	existing := make(map[string]struct{}, len(entityIDs))
-	if len(entityIDs) == 0 {
-		return existing, nil
-	}
-
-	statement := `SELECT id FROM ` + kind.Table + ` WHERE account_id = $1::uuid AND id = ANY($2::text[])`
-
-	rows, err := database.Query(ctx, statement, accountID, entityIDs)
-	if err != nil {
-		return nil, fmt.Errorf("checking %s parents: %w", kind.Name, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var entityID string
-		if err := rows.Scan(&entityID); err != nil {
-			return nil, fmt.Errorf("checking %s parents: %w", kind.Name, err)
-		}
-		existing[entityID] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("checking %s parents: %w", kind.Name, err)
-	}
-	return existing, nil
-}
-
 // PendingWrite is one entity that survived validation and the version check.
 type PendingWrite struct {
 	Kind     string
@@ -558,17 +504,28 @@ type DeltaRow struct {
 	Change    json.RawMessage
 }
 
-// MaxDeltaBytes is the budget one pull response spends on rows before it stops at the next sequence
-// boundary.
+// MaxDeltaBytes is the budget one pull response may spend on rows.
 //
-// Comfortably above one push (4 MB, §7) plus what base64 adds, so it never cuts inside the work of
-// a single client and only ever draws the line between two of them. Lower would make a large push
+// Comfortably above one push (4 MB) plus what base64 adds, so it never cuts inside the work of a
+// single client and only ever draws the line between two of them. Lower would make a large push
 // unpullable; much higher would put the server's memory at the mercy of how many documents an
-// account happens to have changed since a device was last on wifi.
+// account happens to have changed since a device was last on wifi. Spent in [SelectDeltaCutoff]
+// from estimates, before any row is rendered.
 const MaxDeltaBytes = 8 << 20
+
+// DeltaBytesOverrunFactor is how far past [MaxDeltaBytes] a multi-sequence page may land before the
+// estimate is treated as broken rather than imprecise.
+//
+// A single-sequence page is exempt however large: refusing it would make the account unpullable. A
+// large overrun on a multi-sequence page means a byteWeight no longer matches its changeJSON.
+const DeltaBytesOverrunFactor = 4
 
 // selectDeltaStatement is built once from the registry: one branch per kind, unioned and ordered
 // globally so a client receives parents before children within each sequence value.
+//
+// No LIMIT — [SelectDeltaCutoff] has already chosen the last sequence, so every row returned is one
+// the client receives. A LIMIT here cannot push down through the sort, which would render
+// changeJSON for the whole remaining delta on every page and discard all but one page of it.
 var selectDeltaStatement = func() string {
 	var query strings.Builder
 	query.WriteString("WITH delta AS (\n")
@@ -582,57 +539,123 @@ var selectDeltaStatement = func() string {
 			kind.Rank, kind.changeJSON, kind.Table,
 		)
 	}
-	query.WriteString(")\nSELECT change_seq, change FROM delta ORDER BY change_seq, kind_rank, id LIMIT $4")
+	query.WriteString(")\nSELECT change_seq, change FROM delta ORDER BY change_seq, kind_rank, id")
 	return query.String()
 }()
+
+// selectDeltaCutoffStatement decides where a page ends, before anything is rendered. Each branch
+// contributes a sequence number and an estimated size; the answer is the largest sequence whose
+// running totals are inside both budgets.
+//
+// The fallback to min(change_seq) is what makes `limit` a request rather than a cap. A sequence is
+// atomic across kinds — a page and the section it was moved into are stamped with one value — so a
+// page that ended inside one would let a client acknowledge half a push and never see the rest. An
+// oversized first sequence is returned whole, bounded by the push cap.
+//
+// `complete` reports that nothing was excluded, so the caller can return the account's cursor
+// rather than the last row's — they differ when a sequence exists that this delta has no rows for.
+var selectDeltaCutoffStatement = func() string {
+	var query strings.Builder
+	query.WriteString("WITH weighted AS (\n")
+	for index, kind := range syncKinds {
+		if index > 0 {
+			query.WriteString("\tUNION ALL\n")
+		}
+		fmt.Fprintf(&query,
+			"\tSELECT change_seq, (%s)::bigint AS weight\n\tFROM %s\n"+
+				"\tWHERE account_id = $1::uuid AND change_seq > $2 AND change_seq <= $3\n",
+			kind.byteWeight, kind.Table,
+		)
+	}
+	query.WriteString(`), per_sequence AS (
+	SELECT change_seq, count(*) AS rows_here, sum(weight) AS bytes_here
+	FROM weighted
+	GROUP BY change_seq
+), running AS (
+	SELECT
+		change_seq,
+		sum(rows_here) OVER (ORDER BY change_seq) <= $4
+			AND sum(bytes_here) OVER (ORDER BY change_seq) <= $5 AS fits
+	FROM per_sequence
+)
+SELECT
+	coalesce(max(change_seq) FILTER (WHERE fits), min(change_seq)),
+	coalesce(bool_and(fits), true)
+FROM running`)
+	return query.String()
+}()
+
+// DeltaCutoff is where one pull's page ends.
+type DeltaCutoff struct {
+	// Sequence is the highest change_seq the page includes. Meaningless when Complete is true or
+	// when the delta is empty — the caller uses the account's own cursor then.
+	Sequence int64
+
+	// Complete is true when the whole requested range fits inside the budgets, including when it
+	// holds nothing at all.
+	Complete bool
+
+	// Empty is true when the range holds no rows of any kind.
+	Empty bool
+}
+
+// SelectDeltaCutoff finds the sequence boundary a pull should stop at, without rendering a row.
+func SelectDeltaCutoff(
+	ctx context.Context,
+	database Querier,
+	accountID string,
+	sinceCursor int64,
+	upperBound int64,
+	rowLimit int,
+	byteBudget int64,
+) (DeltaCutoff, error) {
+	var sequence *int64
+	var complete bool
+	err := database.QueryRow(ctx, selectDeltaCutoffStatement,
+		accountID, sinceCursor, upperBound, rowLimit, byteBudget,
+	).Scan(&sequence, &complete)
+	if err != nil {
+		return DeltaCutoff{}, fmt.Errorf("finding a change delta boundary: %w", err)
+	}
+	if sequence == nil {
+		return DeltaCutoff{Complete: true, Empty: true}, nil
+	}
+	return DeltaCutoff{Sequence: *sequence, Complete: complete}, nil
+}
 
 // SelectDelta reads the changes an account accumulated in (sinceCursor, upperBound].
 //
 // The upper bound is not an optimisation. A caller that read the cursor first and then queried
 // without it would miss a push that committed in between: the cursor it returns would sit above
 // rows the client never received, and the client would never ask for them again.
-// It also stops early once the rows read pass [MaxDeltaBytes], reporting that it did so. A row
-// count stopped bounding a response the moment `page_content` joined the registry: 512 documents is
-// a number, not a size, and a client asking for a page of them could ask the server to hold
-// hundreds of megabytes in memory to answer once (R1).
+//
+// The byte total comes back so the caller can check the estimate against what the rows weighed.
 func SelectDelta(
 	ctx context.Context,
 	database Querier,
 	accountID string,
 	sinceCursor int64,
 	upperBound int64,
-	limit int,
-) (delta []DeltaRow, stoppedForBytes bool, err error) {
-	rows, err := database.Query(ctx, selectDeltaStatement, accountID, sinceCursor, upperBound, limit)
+) (delta []DeltaRow, bytesRead int, err error) {
+	rows, err := database.Query(ctx, selectDeltaStatement, accountID, sinceCursor, upperBound)
 	if err != nil {
-		return nil, false, fmt.Errorf("reading a change delta: %w", err)
+		return nil, 0, fmt.Errorf("reading a change delta: %w", err)
 	}
 	defer rows.Close()
 
-	delta = make([]DeltaRow, 0, min(limit, 512))
-	spent := 0
+	delta = make([]DeltaRow, 0, 512)
 	for rows.Next() {
 		var row DeltaRow
 		if err := rows.Scan(&row.ChangeSeq, &row.Change); err != nil {
-			return nil, false, fmt.Errorf("reading a change delta: %w", err)
+			return nil, 0, fmt.Errorf("reading a change delta: %w", err)
 		}
-
-		// Over budget, but only ever stopping where one sequence value ends and the next begins:
-		// SD2 makes a sequence a batch boundary, and a response that ended inside one would let a
-		// client acknowledge half of a push and never see the rest. A single push that exceeds the
-		// budget by itself is therefore returned whole — bounded by the push cap, which is what
-		// bounds this in the end.
-		if spent >= MaxDeltaBytes && len(delta) > 0 && row.ChangeSeq != delta[len(delta)-1].ChangeSeq {
-			return delta, true, nil
-		}
-
-		spent += len(row.Change)
+		bytesRead += len(row.Change)
 		delta = append(delta, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("reading a change delta: %w", err)
+		return nil, 0, fmt.Errorf("reading a change delta: %w", err)
 	}
-	return delta, false, nil
+	return delta, bytesRead, nil
 }
 
 // FindAppliedBatchResponse returns the stored response for a batch the device already pushed.

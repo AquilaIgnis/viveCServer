@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 )
@@ -18,17 +19,30 @@ const maxAuthRequestBytes = 64 * 1024
 // model gets from `ignoreUnknownKeys`, and the same reason the sync tables carry `extra jsonb`
 // (syncPlan.md SD5). Rejecting unknown fields would make every client change a lockstep deploy.
 //
-// It reports whether decoding succeeded, having already written the response if it did not.
+// The body is read before it is decoded, rather than decoded off the reader, so the 413 does not
+// depend on how a JSON implementation reports a failed read: the `encoding/json/v2` experiment in
+// Go 1.26 wrapped *http.MaxBytesError where errors.As could not reach it, which turned an
+// oversized body into a 400.
+//
+// Reports whether decoding succeeded, having already written the response if it did not.
 func decodeJSONRequest(w http.ResponseWriter, r *http.Request, logger *slog.Logger, maxBytes int64, target any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 
-	if err := json.NewDecoder(r.Body).Decode(target); err != nil {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeError(w, logger, http.StatusRequestEntityTooLarge, codePayloadTooLarge, "request body is too large")
 			return false
 		}
 
+		// The connection failed or the client stopped sending part-way through. Nothing about the
+		// request is wrong in a way the client can be told how to fix.
+		writeError(w, logger, http.StatusBadRequest, codeInvalidRequest, "request body could not be read")
+		return false
+	}
+
+	if err := json.Unmarshal(body, target); err != nil {
 		// The decoder's message describes the caller's own JSON, so it is safe to return and is the
 		// single most useful thing to tell someone whose client is malformed.
 		writeError(w, logger, http.StatusBadRequest, codeInvalidRequest, "request body is not valid JSON: "+err.Error())

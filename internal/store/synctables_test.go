@@ -95,6 +95,20 @@ func TestTheDeltaQueryReadsEveryKind(t *testing.T) {
 	}
 }
 
+// TestThePageBoundaryQueryWeighsEveryKind: a kind missing from the boundary query would be rendered
+// by the delta query without ever being counted, so nothing would bound how many of its rows one
+// page could hold.
+func TestThePageBoundaryQueryWeighsEveryKind(t *testing.T) {
+	for _, kind := range SyncKindsInApplyOrder() {
+		if strings.TrimSpace(kind.byteWeight) == "" {
+			t.Errorf("%s has no byteWeight", kind.Name)
+		}
+		if !strings.Contains(selectDeltaCutoffStatement, "FROM "+kind.Table+"\n") {
+			t.Errorf("the page boundary query never weighs %s", kind.Table)
+		}
+	}
+}
+
 func TestValidateEntityIDRefusesWhatPostgresCannotStore(t *testing.T) {
 	if err := ValidateEntityID(""); err == nil {
 		t.Error("an empty id was accepted")
