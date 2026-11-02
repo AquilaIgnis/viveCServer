@@ -1,6 +1,6 @@
 package version
 
 const (
-	Current = "1.1.1"
+	Current = "1.2.0"
 	OpenApi = "0.10.0"
 )

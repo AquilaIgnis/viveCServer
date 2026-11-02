@@ -79,12 +79,12 @@ paths:
       description: This probe does not access PostgreSQL and remains healthy during a database outage.
       security: []
       responses:
-        "200":
+        '200':
           description: The server process is running.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthyStatus"
+                $ref: '#/components/schemas/HealthyStatus'
               example:
                 status: ok
 
@@ -95,20 +95,20 @@ paths:
       summary: Check whether the server can reach PostgreSQL
       security: []
       responses:
-        "200":
+        '200':
           description: The server and PostgreSQL are ready to serve requests.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HealthyStatus"
+                $ref: '#/components/schemas/HealthyStatus'
               example:
                 status: ok
-        "503":
+        '503':
           description: PostgreSQL is unavailable.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UnavailableStatus"
+                $ref: '#/components/schemas/UnavailableStatus'
               example:
                 status: unavailable
                 reason: database
@@ -130,41 +130,41 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreateAccountRequest"
+              $ref: '#/components/schemas/CreateAccountRequest'
             example:
               email: owner@example.com
               password: correct horse battery staple
       responses:
-        "201":
+        '201':
           description: Account created.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CreateAccountResponse"
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "403":
+                $ref: '#/components/schemas/CreateAccountResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '403':
           description: Public account registration is disabled.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: signup_closed
                 message: this server does not accept registrations; the operator creates accounts with the create-account command
-        "409":
+        '409':
           description: The server already has its sole account.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: signup_closed
                 message: this server already has its account
-        "413":
-          $ref: "#/components/responses/PayloadTooLarge"
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /v1/devices:
     post:
@@ -186,7 +186,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RegisterDeviceRequest"
+              $ref: '#/components/schemas/RegisterDeviceRequest'
             example:
               email: owner@example.com
               password: correct horse battery staple
@@ -194,27 +194,27 @@ paths:
               name: Pixel Tablet Emulator
               platform: Android
       responses:
-        "201":
+        '201':
           description: Device registered. Persist the returned token in secure client storage.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RegisterDeviceResponse"
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
+                $ref: '#/components/schemas/RegisterDeviceResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
           description: The email or password is incorrect.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: invalid_credentials
                 message: email or password is incorrect
-        "413":
-          $ref: "#/components/responses/PayloadTooLarge"
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
     get:
       operationId: listDevices
@@ -223,16 +223,16 @@ paths:
       security:
         - deviceToken: []
       responses:
-        "200":
+        '200':
           description: Registered devices, newest first. Revoked devices remain in the list.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ListDevicesResponse"
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "500":
-          $ref: "#/components/responses/InternalError"
+                $ref: '#/components/schemas/ListDevicesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /v1/devices/{deviceID}:
     patch:
@@ -252,38 +252,38 @@ paths:
       security:
         - deviceToken: []
       parameters:
-        - $ref: "#/components/parameters/DeviceID"
+        - $ref: '#/components/parameters/DeviceID'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RenameDeviceRequest"
+              $ref: '#/components/schemas/RenameDeviceRequest'
       responses:
-        "204":
+        '204':
           description: Device renamed. The response has no body.
-        "400":
+        '400':
           description: The name is empty, too long, or holds a NUL character.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: invalid_request
                 message: a device name is required
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "404":
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
           description: No matching live device exists for the authenticated account.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: not_found
                 message: no such device
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
     delete:
       operationId: revokeDevice
@@ -295,23 +295,23 @@ paths:
       security:
         - deviceToken: []
       parameters:
-        - $ref: "#/components/parameters/DeviceID"
+        - $ref: '#/components/parameters/DeviceID'
       responses:
-        "204":
+        '204':
           description: Device revoked. The response has no body.
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "404":
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
           description: No matching device exists for the authenticated account.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: not_found
                 message: no such device
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /v1/cursor:
     get:
@@ -326,18 +326,18 @@ paths:
       security:
         - deviceToken: []
       responses:
-        "200":
+        '200':
           description: The account's current cursor. A brand new account is at 0.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CursorResponse"
+                $ref: '#/components/schemas/CursorResponse'
               example:
                 cursor: 41
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /v1/changes/watch:
     get:
@@ -376,7 +376,7 @@ paths:
             minimum: 0
             default: 0
       responses:
-        "200":
+        '200':
           description: |
             A stream of `ready`, `changes`, or terminal `revoked` events. The data of `ready` and
             `changes` is a PullChangesResponse JSON object.
@@ -390,12 +390,12 @@ paths:
 
                 event: changes
                 data: {"changes":[{"kind":"notebook","id":"756f7fb6-c35a-4478-b875-c3f9836ed651","version":2,"seq":42,"deletedAt":null,"updatedAt":1757280000000,"name":"Work","colorArgb":-14575885,"sortIndex":0,"expanded":true,"createdAt":1757193600000}],"purges":[],"cursor":42,"hasMore":false}
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /v1/changes:
     get:
@@ -438,20 +438,20 @@ paths:
             maximum: 2048
             default: 512
       responses:
-        "200":
+        '200':
           description: |
             The delta, possibly empty. An empty `changes` with `hasMore` true cannot happen; a
             client that is ahead of the server receives the server's lower cursor.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PullChangesResponse"
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "500":
-          $ref: "#/components/responses/InternalError"
+                $ref: '#/components/schemas/PullChangesResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
     post:
       operationId: pushChanges
@@ -494,7 +494,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/PushChangesRequest"
+              $ref: '#/components/schemas/PushChangesRequest'
             example:
               batchId: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
               changes:
@@ -510,29 +510,29 @@ paths:
                   cloudOnlyAt: null
                   createdAt: 1755300000000
       responses:
-        "200":
+        '200':
           description: |
             The batch was processed. A response with an empty `applied` and a populated `rejected`
             is a successful request describing a batch that changed nothing.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PushChangesResponse"
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "413":
+                $ref: '#/components/schemas/PushChangesResponse'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '413':
           description: The batch exceeds 4 MiB.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: payload_too_large
                 message: request body is too large
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /v1/blobs/{sha256}:
     head:
@@ -550,9 +550,9 @@ paths:
       security:
         - deviceToken: []
       parameters:
-        - $ref: "#/components/parameters/BlobDigest"
+        - $ref: '#/components/parameters/BlobDigest'
       responses:
-        "204":
+        '204':
           description: The account holds these bytes. Do not upload them again.
           headers:
             ETag:
@@ -562,14 +562,14 @@ paths:
             Cache-Control:
               schema:
                 type: string
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "404":
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
           description: The account does not hold these bytes. Upload them.
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
     put:
       operationId: uploadBlob
@@ -589,7 +589,7 @@ paths:
       security:
         - deviceToken: []
       parameters:
-        - $ref: "#/components/parameters/BlobDigest"
+        - $ref: '#/components/parameters/BlobDigest'
       requestBody:
         required: true
         content:
@@ -598,43 +598,43 @@ paths:
               type: string
               format: binary
       responses:
-        "201":
+        '201':
           description: The bytes were stored. They can now be named by `blobRefs` and by an `attachment` id.
           headers:
             ETag:
               schema:
                 type: string
-        "204":
+        '204':
           description: The account already held these bytes; nothing was stored.
           headers:
             ETag:
               schema:
                 type: string
-        "400":
+        '400':
           description: |
             The digest is not 64 lowercase hex characters, or the bytes do not hash to it.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: invalid_request
                 message: the uploaded bytes do not hash to the digest in the URL
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "413":
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '413':
           description: |
             The attachment is larger than the per-attachment cap, 32 MiB by default. That cap is the
             only storage limit: there is no per-account quota.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: payload_too_large
                 message: an attachment may not exceed 33554432 bytes
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
     get:
       operationId: downloadBlob
@@ -652,9 +652,9 @@ paths:
       security:
         - deviceToken: []
       parameters:
-        - $ref: "#/components/parameters/BlobDigest"
+        - $ref: '#/components/parameters/BlobDigest'
       responses:
-        "200":
+        '200':
           description: The bytes.
           headers:
             ETag:
@@ -668,31 +668,31 @@ paths:
               schema:
                 type: string
                 format: binary
-        "206":
+        '206':
           description: The requested range of the bytes.
           content:
             application/octet-stream:
               schema:
                 type: string
                 format: binary
-        "304":
+        '304':
           description: The client's copy is current.
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
-          $ref: "#/components/responses/Unauthenticated"
-        "404":
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
           description: |
             This account holds no such attachment. Also the answer when another account holds it, and
             when the row exists but its bytes do not — in the second case, uploading again repairs it.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "416":
+                $ref: '#/components/schemas/ErrorResponse'
+        '416':
           description: The requested range lies outside the content.
-        "500":
-          $ref: "#/components/responses/InternalError"
+        '500':
+          $ref: '#/components/responses/InternalError'
 
 components:
   securitySchemes:
@@ -713,7 +713,7 @@ components:
         entry — and two spellings of one identity is how one picture becomes two files.
       schema:
         type: string
-        pattern: "^[0-9a-f]{64}$"
+        pattern: '^[0-9a-f]{64}$'
       example: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
     DeviceID:
@@ -732,7 +732,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: '#/components/schemas/ErrorResponse'
           example:
             error: invalid_request
             message: request body is not valid JSON
@@ -742,7 +742,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: '#/components/schemas/ErrorResponse'
           example:
             error: payload_too_large
             message: request body is too large
@@ -758,7 +758,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: '#/components/schemas/ErrorResponse'
           example:
             error: unauthenticated
             message: unknown or revoked token
@@ -768,7 +768,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: '#/components/schemas/ErrorResponse'
           example:
             error: internal
             message: something went wrong
@@ -827,7 +827,7 @@ components:
         platform:
           type: string
           maxLength: 64
-          default: ""
+          default: ''
           description: Optional platform label used only for display.
           example: Android
         installationId:
@@ -853,7 +853,7 @@ components:
           example: a62c615f-5a73-47bb-b704-ad49cf527ec2
         token:
           type: string
-          pattern: "^vive_[A-Za-z0-9_-]+$"
+          pattern: '^vive_[A-Za-z0-9_-]+$'
           description: Bearer credential returned only by this response. Store it securely.
           example: vive_c29tZS1leGFtcGxlLWRldmljZS10b2tlbg
 
@@ -865,7 +865,7 @@ components:
         devices:
           type: array
           items:
-            $ref: "#/components/schemas/Device"
+            $ref: '#/components/schemas/Device'
 
     Device:
       type: object
@@ -920,7 +920,7 @@ components:
         changes:
           type: array
           items:
-            $ref: "#/components/schemas/Change"
+            $ref: '#/components/schemas/Change'
         purges:
           type: array
           description: |
@@ -933,7 +933,7 @@ components:
             anything under it afterwards is rejected `purged`. Applying one is not optional and the
             server does not wait to find out whether you did.
           items:
-            $ref: "#/components/schemas/Purge"
+            $ref: '#/components/schemas/Purge'
         cursor:
           type: integer
           format: int64
@@ -950,7 +950,7 @@ components:
       required: [kind, id, seq, purgedAt]
       properties:
         kind:
-          $ref: "#/components/schemas/EntityKind"
+          $ref: '#/components/schemas/EntityKind'
         id:
           type: string
           description: The erased entity's id. Only `notebook` is erased this way today.
@@ -985,7 +985,7 @@ components:
           type: array
           maxItems: 512
           items:
-            $ref: "#/components/schemas/PushChange"
+            $ref: '#/components/schemas/PushChange'
 
     PushChangesResponse:
       type: object
@@ -995,11 +995,11 @@ components:
         applied:
           type: array
           items:
-            $ref: "#/components/schemas/AppliedChange"
+            $ref: '#/components/schemas/AppliedChange'
         rejected:
           type: array
           items:
-            $ref: "#/components/schemas/RejectedChange"
+            $ref: '#/components/schemas/RejectedChange'
         cursor:
           type: integer
           format: int64
@@ -1015,7 +1015,7 @@ components:
       required: [kind, id, version]
       properties:
         kind:
-          $ref: "#/components/schemas/EntityKind"
+          $ref: '#/components/schemas/EntityKind'
         id:
           type: string
         version:
@@ -1035,12 +1035,12 @@ components:
         id:
           type: string
         reason:
-          $ref: "#/components/schemas/RejectionReason"
+          $ref: '#/components/schemas/RejectionReason'
         message:
           type: string
           description: Human-readable detail. Client logic must branch on `reason`, not this field.
         current:
-          $ref: "#/components/schemas/Change"
+          $ref: '#/components/schemas/Change'
 
     RejectionReason:
       type: string
@@ -1091,7 +1091,7 @@ components:
       required: [kind, id, version, seq, updatedAt]
       properties:
         kind:
-          $ref: "#/components/schemas/EntityKind"
+          $ref: '#/components/schemas/EntityKind'
         id:
           type: string
           maxLength: 512
@@ -1107,7 +1107,7 @@ components:
           minimum: 1
           description: The account sequence value this write was stamped with.
         deletedAt:
-          type: [integer, "null"]
+          type: [integer, 'null']
           format: int64
           description: |
             Tombstone timestamp in client epoch milliseconds, or null. A deleted entity keeps all of
@@ -1124,7 +1124,7 @@ components:
       required: [kind, id, baseVersion, updatedAt]
       properties:
         kind:
-          $ref: "#/components/schemas/EntityKind"
+          $ref: '#/components/schemas/EntityKind'
         id:
           type: string
           maxLength: 512
@@ -1137,7 +1137,7 @@ components:
             entity then rejects with `version_conflict` and its current state, which is also how a
             client that lost its local state recovers.
         deletedAt:
-          type: [integer, "null"]
+          type: [integer, 'null']
           format: int64
           description: Set to delete. Send the entity's other fields as they stand locally.
         updatedAt:
@@ -1153,50 +1153,50 @@ components:
         client must therefore never reject a change for carrying a field it does not recognise, and
         must never treat this schema as closed.
       oneOf:
-        - $ref: "#/components/schemas/NotebookChange"
-        - $ref: "#/components/schemas/SectionChange"
-        - $ref: "#/components/schemas/PageChange"
-        - $ref: "#/components/schemas/PageContentChange"
-        - $ref: "#/components/schemas/InkStrokeChange"
-        - $ref: "#/components/schemas/InkEraseChange"
-        - $ref: "#/components/schemas/InkMoveChange"
-        - $ref: "#/components/schemas/AttachmentChange"
+        - $ref: '#/components/schemas/NotebookChange'
+        - $ref: '#/components/schemas/SectionChange'
+        - $ref: '#/components/schemas/PageChange'
+        - $ref: '#/components/schemas/PageContentChange'
+        - $ref: '#/components/schemas/InkStrokeChange'
+        - $ref: '#/components/schemas/InkEraseChange'
+        - $ref: '#/components/schemas/InkMoveChange'
+        - $ref: '#/components/schemas/AttachmentChange'
       discriminator:
         propertyName: kind
         mapping:
-          notebook: "#/components/schemas/NotebookChange"
-          section: "#/components/schemas/SectionChange"
-          page: "#/components/schemas/PageChange"
-          pageContent: "#/components/schemas/PageContentChange"
-          inkStroke: "#/components/schemas/InkStrokeChange"
-          inkErase: "#/components/schemas/InkEraseChange"
-          inkMove: "#/components/schemas/InkMoveChange"
-          attachment: "#/components/schemas/AttachmentChange"
+          notebook: '#/components/schemas/NotebookChange'
+          section: '#/components/schemas/SectionChange'
+          page: '#/components/schemas/PageChange'
+          pageContent: '#/components/schemas/PageContentChange'
+          inkStroke: '#/components/schemas/InkStrokeChange'
+          inkErase: '#/components/schemas/InkEraseChange'
+          inkMove: '#/components/schemas/InkMoveChange'
+          attachment: '#/components/schemas/AttachmentChange'
 
     PushChange:
       description: |
         One entity as the client sends it. Unrecognised properties are accepted and stored, subject
         to a 16 KiB limit per entity.
       oneOf:
-        - $ref: "#/components/schemas/NotebookPush"
-        - $ref: "#/components/schemas/SectionPush"
-        - $ref: "#/components/schemas/PagePush"
-        - $ref: "#/components/schemas/PageContentPush"
-        - $ref: "#/components/schemas/InkStrokePush"
-        - $ref: "#/components/schemas/InkErasePush"
-        - $ref: "#/components/schemas/InkMovePush"
-        - $ref: "#/components/schemas/AttachmentPush"
+        - $ref: '#/components/schemas/NotebookPush'
+        - $ref: '#/components/schemas/SectionPush'
+        - $ref: '#/components/schemas/PagePush'
+        - $ref: '#/components/schemas/PageContentPush'
+        - $ref: '#/components/schemas/InkStrokePush'
+        - $ref: '#/components/schemas/InkErasePush'
+        - $ref: '#/components/schemas/InkMovePush'
+        - $ref: '#/components/schemas/AttachmentPush'
       discriminator:
         propertyName: kind
         mapping:
-          notebook: "#/components/schemas/NotebookPush"
-          section: "#/components/schemas/SectionPush"
-          page: "#/components/schemas/PagePush"
-          pageContent: "#/components/schemas/PageContentPush"
-          inkStroke: "#/components/schemas/InkStrokePush"
-          inkErase: "#/components/schemas/InkErasePush"
-          inkMove: "#/components/schemas/InkMovePush"
-          attachment: "#/components/schemas/AttachmentPush"
+          notebook: '#/components/schemas/NotebookPush'
+          section: '#/components/schemas/SectionPush'
+          page: '#/components/schemas/PagePush'
+          pageContent: '#/components/schemas/PageContentPush'
+          inkStroke: '#/components/schemas/InkStrokePush'
+          inkErase: '#/components/schemas/InkErasePush'
+          inkMove: '#/components/schemas/InkMovePush'
+          attachment: '#/components/schemas/AttachmentPush'
 
     NotebookFields:
       type: object
@@ -1216,7 +1216,7 @@ components:
           type: boolean
           description: Legacy compatibility field. Current clients keep rail expansion device-local.
         closedAt:
-          type: [integer, "null"]
+          type: [integer, 'null']
           format: int64
           description: |
             Client wall clock at which the notebook left the app's rail, or null while it is open.
@@ -1226,7 +1226,7 @@ components:
             The server reads this to decide what a deletion of this notebook means; see
             `POST /v1/changes`.
         cloudOnlyAt:
-          type: [integer, "null"]
+          type: [integer, 'null']
           format: int64
           description: |
             Client wall clock from which this server holds the only copy of the notebook's
@@ -1323,7 +1323,7 @@ components:
           maxItems: 512
           items:
             type: string
-            pattern: "^[0-9a-f]{64}$"
+            pattern: '^[0-9a-f]{64}$'
           description: |
             The attachment digests this document references, extracted by the client while pushing.
 
@@ -1339,7 +1339,23 @@ components:
     InkStrokeFields:
       type: object
       additionalProperties: true
-      required: [pageId, drawOrder, brushFamily, brushVersion, sizeDp, colorArgb, epsilon, stabilization, minX, minY, maxX, maxY, points, createdAt]
+      required:
+        [
+          pageId,
+          drawOrder,
+          brushFamily,
+          brushVersion,
+          sizeDp,
+          colorArgb,
+          epsilon,
+          stabilization,
+          minX,
+          minY,
+          maxX,
+          maxY,
+          points,
+          createdAt,
+        ]
       description: |
         One stroke. Immutable in everything that draws it — points, brush, bounds — with a small
         mutable envelope: `deletedAt` (an erase tombstones a stroke, an undo clears it again),
@@ -1378,7 +1394,7 @@ components:
           type: integer
           format: int32
         colorFollowsTheme:
-          type: [boolean, "null"]
+          type: [boolean, 'null']
           description: |
             Whether `colorArgb` was the automatic colour rather than one the user picked, so Switch
             Background can re-resolve it. Absent or null on a stroke drawn before the app recorded
@@ -1418,7 +1434,7 @@ components:
           type: integer
           format: int64
         groupId:
-          type: [string, "null"]
+          type: [string, 'null']
           maxLength: 512
           description: Optional logical object group. Geometry stays immutable when membership changes.
 
@@ -1559,87 +1575,87 @@ components:
 
     NotebookChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/NotebookFields"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/NotebookFields'
 
     SectionChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/SectionFields"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/SectionFields'
 
     PageChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/PageFields"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/PageFields'
 
     PageContentChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/PageContentFields"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/PageContentFields'
 
     InkStrokeChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/InkStrokeFields"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/InkStrokeFields'
 
     InkEraseChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/InkEraseFields"
-        - $ref: "#/components/schemas/InkOperationTargets"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/InkEraseFields'
+        - $ref: '#/components/schemas/InkOperationTargets'
 
     InkMoveChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/InkMoveFields"
-        - $ref: "#/components/schemas/InkOperationTargets"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/InkMoveFields'
+        - $ref: '#/components/schemas/InkOperationTargets'
 
     AttachmentChange:
       allOf:
-        - $ref: "#/components/schemas/ChangeEnvelope"
-        - $ref: "#/components/schemas/AttachmentFields"
+        - $ref: '#/components/schemas/ChangeEnvelope'
+        - $ref: '#/components/schemas/AttachmentFields'
 
     NotebookPush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/NotebookFields"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/NotebookFields'
 
     SectionPush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/SectionFields"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/SectionFields'
 
     PagePush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/PageFields"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/PageFields'
 
     PageContentPush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/PageContentFields"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/PageContentFields'
 
     InkStrokePush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/InkStrokeFields"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/InkStrokeFields'
 
     InkErasePush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/InkEraseFields"
-        - $ref: "#/components/schemas/InkOperationTargets"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/InkEraseFields'
+        - $ref: '#/components/schemas/InkOperationTargets'
 
     InkMovePush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/InkMoveFields"
-        - $ref: "#/components/schemas/InkOperationTargets"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/InkMoveFields'
+        - $ref: '#/components/schemas/InkOperationTargets'
 
     AttachmentPush:
       allOf:
-        - $ref: "#/components/schemas/PushChangeEnvelope"
-        - $ref: "#/components/schemas/AttachmentFields"
+        - $ref: '#/components/schemas/PushChangeEnvelope'
+        - $ref: '#/components/schemas/AttachmentFields'
 
     RenameDeviceRequest:
       type: object
@@ -1658,7 +1674,7 @@ components:
       required: [error]
       properties:
         error:
-          $ref: "#/components/schemas/ErrorCode"
+          $ref: '#/components/schemas/ErrorCode'
         message:
           type: string
           description: Human-readable detail. Client logic must branch on `error`, not this field.
