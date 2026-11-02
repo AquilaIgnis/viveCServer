@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,6 +19,10 @@ type registerDeviceRequest struct {
 	Password string `json:"password"`
 	Name     string `json:"name"`
 	Platform string `json:"platform"`
+
+	// InstallationID is optional. When present, a sign-in from an installation that already has a
+	// device row rotates that row's token instead of adding another row.
+	InstallationID string `json:"installationId"`
 }
 
 type registerDeviceResponse struct {
@@ -48,7 +53,7 @@ type listDevicesResponse struct {
 // This is the only endpoint that takes a password, and the only one that returns a token. Every
 // other request authenticates with the token, so the password is typed once per device rather than
 // held anywhere.
-func handleRegisterDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc {
+func handleRegisterDevice(pool *pgxpool.Pool, logger *slog.Logger, changeEvents *changefeed.Broker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var request registerDeviceRequest
 		if !decodeJSONRequest(w, r, logger, maxAuthRequestBytes, &request) {
@@ -68,6 +73,13 @@ func handleRegisterDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerF
 		platform, err := validatePlatform(request.Platform)
 		if err != nil {
 			writeError(w, logger, http.StatusBadRequest, codeInvalidRequest, err.Error())
+			return
+		}
+		// Checked before the password, so a malformed id is a 400 rather than an aborted insert,
+		// and before the database sees it, because a bad `::uuid` cast is an error, not an answer.
+		installationID := strings.TrimSpace(request.InstallationID)
+		if installationID != "" && !store.IsUUID(installationID) {
+			writeError(w, logger, http.StatusBadRequest, codeInvalidRequest, "installationId must be a UUID")
 			return
 		}
 
@@ -113,11 +125,18 @@ func handleRegisterDevice(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerF
 			return
 		}
 
-		deviceID, err := store.RegisterDevice(r.Context(), pool, account.ID, deviceName, platform, tokenHash)
+		deviceID, err := store.RegisterDevice(
+			r.Context(), pool, account.ID, installationID, deviceName, platform, tokenHash,
+		)
 		if err != nil {
 			writeInternalError(w, logger, "registering a device failed", err)
 			return
 		}
+		// A reused row's old token stopped working at that commit. A stream it opened would
+		// otherwise stay subscribed for as long as the connection lasts. Closed rather than sent
+		// `revoked`: the client is about to hold the new token, and that event tells it to forget
+		// the account.
+		changeEvents.Disconnect(account.ID, deviceID)
 
 		logger.Info("device registered", "account_id", account.ID, "device_id", deviceID, "platform", platform)
 		writeJSON(w, logger, http.StatusCreated, registerDeviceResponse{

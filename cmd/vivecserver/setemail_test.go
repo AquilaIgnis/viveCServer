@@ -90,7 +90,7 @@ func TestSetEmailChangesOnlyTheSignInAddress(t *testing.T) {
 		t.Fatalf("creating a browser session: %v", err)
 	}
 	deviceTokenHash := uniqueTokenHash(t)
-	deviceID, err := store.RegisterDevice(ctx, pool, accountID, "Studio tablet", "android", deviceTokenHash)
+	deviceID, err := store.RegisterDevice(ctx, pool, accountID, "", "Studio tablet", "android", deviceTokenHash)
 	if err != nil {
 		t.Fatalf("registering a device: %v", err)
 	}

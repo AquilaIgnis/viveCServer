@@ -11,5 +11,5 @@ memory
 .env
 deploy/.env
 data
-deploy/data
+deploy/_data
 **/data

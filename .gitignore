@@ -1,7 +1,7 @@
 memory
 viveNotes
 .env
-deploy/data/
+deploy/_data/
 todo.txt
 
 # Locally built binary

@@ -17,7 +17,7 @@ services:
       POSTGRES_DB: vive
       POSTGRES_PASSWORD: ${VIVE_POSTGRES_PASSWORD:-vive-local-only}
     volumes:
-      - ./data/postgres:/var/lib/postgresql:Z
+      - ./_data/postgres:/var/lib/postgresql:Z
     ports:
       - '${VIVE_POSTGRES_BIND:-127.0.0.1}:${VIVE_POSTGRES_PORT:-5432}:5432'
     healthcheck:
@@ -43,8 +43,8 @@ services:
       VIVE_LOG_LEVEL: ${VIVE_LOG_LEVEL:-info}
     volumes:
       # have to run this sudo because docker if fucking retarded
-      # sudo chown -R 1000:1000 deploy/data/blobs
-      - ./data/blobs:/var/lib/vivecserver/blobs:Z
+      # sudo chown -R 1000:1000 deploy/_data/blobs
+      - ./_data/blobs:/var/lib/vivecserver/blobs:Z
     ports:
       - '${VIVE_ADMIN_PORT:-8182}:8080'
       - '${VIVE_SYNC_PORT:-5442}:8281'

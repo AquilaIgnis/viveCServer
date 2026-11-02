@@ -46,6 +46,36 @@ func TestRevocationReplacesAPendingContentWakeup(t *testing.T) {
 	}
 }
 
+// TestDisconnectReachesOnlyThatDeviceAndOutranksAWakeup: a replaced token closes that device's
+// stream and nobody else's, and it is not left waiting behind a content wakeup.
+func TestDisconnectReachesOnlyThatDeviceAndOutranksAWakeup(t *testing.T) {
+	broker := NewBroker()
+	tablet, cancelTablet := broker.Subscribe("account", "tablet")
+	defer cancelTablet()
+	phone, cancelPhone := broker.Subscribe("account", "phone")
+	defer cancelPhone()
+
+	broker.Publish("account", "")
+	broker.Disconnect("account", "tablet")
+
+	select {
+	case event := <-tablet:
+		if event != Disconnected {
+			t.Fatalf("event = %v, want Disconnected", event)
+		}
+	default:
+		t.Fatal("the device whose token was replaced received no event")
+	}
+	select {
+	case event := <-phone:
+		if event != Changes {
+			t.Fatalf("the other device received %v, want its ordinary wakeup", event)
+		}
+	default:
+		t.Fatal("the other device lost its wakeup")
+	}
+}
+
 func assertEvent(t *testing.T, events <-chan Event, label string) {
 	t.Helper()
 	select {

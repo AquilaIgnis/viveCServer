@@ -36,12 +36,22 @@ const (
 // argonVersion is the algorithm version constant Argon2 stamps into its own PHC strings.
 const argonVersion = 19
 
+// maxConcurrentPasswordDerivations bounds how many Argon2id derivations run at once.
+//
+// Each one reserves 64 MiB, and every sign-in attempt costs one whether or not the account exists,
+// so without a bound anyone who can reach the port can make the server allocate 64 MiB per request
+// in flight. Two keeps sign-in responsive and caps that at about 128 MiB, which a small
+// single-board host can afford; further attempts queue here before allocating anything.
+const maxConcurrentPasswordDerivations = 2
+
 var (
 	// ErrPasswordMismatch is returned when a password does not verify. It is deliberately the same
 	// error whatever went wrong, so nothing about the stored hash leaks through the difference.
 	ErrPasswordMismatch = errors.New("password does not match")
 
 	ErrHashMalformed = errors.New("stored password hash is not a valid argon2id PHC string")
+
+	passwordDerivationSlots = make(chan struct{}, maxConcurrentPasswordDerivations)
 )
 
 // HashPassword returns a PHC-format `$argon2id$...` string safe to store verbatim.
@@ -55,7 +65,7 @@ func HashPassword(plainPassword string) (string, error) {
 		return "", fmt.Errorf("generating a password salt: %w", err)
 	}
 
-	digest := argon2.IDKey(
+	digest := deriveArgon2ID(
 		[]byte(plainPassword), salt,
 		argonIterations, argonMemoryKiB, argonThreads, argonKeyBytes,
 	)
@@ -78,7 +88,7 @@ func VerifyPassword(encodedHash string, plainPassword string) error {
 		return err
 	}
 
-	actualDigest := argon2.IDKey(
+	actualDigest := deriveArgon2ID(
 		[]byte(plainPassword), salt,
 		parameters.iterations, parameters.memoryKiB, parameters.threads, uint32(len(expectedDigest)),
 	)
@@ -87,6 +97,20 @@ func VerifyPassword(encodedHash string, plainPassword string) error {
 		return ErrPasswordMismatch
 	}
 	return nil
+}
+
+// deriveArgon2ID is the only call into argon2, so every derivation takes a slot first.
+func deriveArgon2ID(
+	password []byte,
+	salt []byte,
+	iterations uint32,
+	memoryKiB uint32,
+	threads uint8,
+	keyBytes uint32,
+) []byte {
+	passwordDerivationSlots <- struct{}{}
+	defer func() { <-passwordDerivationSlots }()
+	return argon2.IDKey(password, salt, iterations, memoryKiB, threads, keyBytes)
 }
 
 // NeedsRehash reports whether a stored hash was made with weaker parameters than the current ones,

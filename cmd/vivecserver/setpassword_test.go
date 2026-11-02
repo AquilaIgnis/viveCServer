@@ -153,7 +153,7 @@ func TestSetPasswordLeavesRegisteredDevicesAlone(t *testing.T) {
 	}
 
 	tokenHash := uniqueTokenHash(t)
-	deviceID, err := store.RegisterDevice(ctx, pool, accountID, "Studio tablet", "android", tokenHash)
+	deviceID, err := store.RegisterDevice(ctx, pool, accountID, "", "Studio tablet", "android", tokenHash)
 	if err != nil {
 		t.Fatalf("registering a device: %v", err)
 	}

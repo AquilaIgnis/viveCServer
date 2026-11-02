@@ -66,7 +66,7 @@ func NewSyncHandler(pool *pgxpool.Pool, logger *slog.Logger, options Options) ht
 
 	// Unauthenticated by necessity: these are how a caller obtains a credential in the first place.
 	mux.HandleFunc("POST /v1/accounts", handleCreateAccount(pool, logger, options.SignupMode))
-	mux.HandleFunc("POST /v1/devices", handleRegisterDevice(pool, logger))
+	mux.HandleFunc("POST /v1/devices", handleRegisterDevice(pool, logger, changeEvents))
 
 	// Everything else requires a device token.
 	mux.Handle("GET /v1/devices", authenticated(handleListDevices(pool, logger)))

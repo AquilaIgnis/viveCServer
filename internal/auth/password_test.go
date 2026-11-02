@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPasswordRoundTrip(t *testing.T) {
@@ -115,5 +116,42 @@ func TestSpendVerificationTimeIsSafeToCallConcurrently(t *testing.T) {
 	}
 	for i := 0; i < 4; i++ {
 		<-done
+	}
+}
+
+// TestAThirdDerivationWaitsForASlot: with both slots taken, hashing must queue rather than
+// allocate another 64 MiB, and must proceed as soon as one is released.
+func TestAThirdDerivationWaitsForASlot(t *testing.T) {
+	for range maxConcurrentPasswordDerivations {
+		passwordDerivationSlots <- struct{}{}
+	}
+	released := 0
+	defer func() {
+		for ; released < maxConcurrentPasswordDerivations; released++ {
+			<-passwordDerivationSlots
+		}
+	}()
+
+	finished := make(chan error, 1)
+	go func() {
+		_, err := HashPassword("queued behind the others")
+		finished <- err
+	}()
+
+	select {
+	case <-finished:
+		t.Fatal("a derivation ran while every slot was taken")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	<-passwordDerivationSlots
+	released++
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("hashing after a slot freed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a derivation did not proceed once a slot was released")
 	}
 }

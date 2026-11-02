@@ -36,22 +36,41 @@ type Device struct {
 	RevokedAt     *time.Time
 }
 
-// RegisterDevice stores a new device for an account and returns its id.
+// RegisterDevice stores a device for an account and returns its id.
+//
+// A client that sends a stable installation id gets one row per installation: a later password
+// sign-in from the same installation replaces that row's token rather than adding a duplicate. An
+// empty id keeps the older behaviour, a distinct row per call, for clients that do not send one.
+//
+// Reusing a row is a fresh registration in everything but identity, so it clears a revocation (the
+// caller has just proved the password) and resets `last_pulled_seq` to 0, the value a new row starts
+// at. That reset is the conservative direction: a client that signs in again may restart from an
+// earlier cursor than the one this row last acknowledged, and a stale high value would let the purge
+// log drop a permanent deletion that client has not seen. The first pull after sign-in moves the
+// value back up.
 func RegisterDevice(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	accountID string,
+	installationID string,
 	deviceName string,
 	platform string,
 	tokenHash []byte,
 ) (string, error) {
 	const statement = `
-		INSERT INTO devices (account_id, name, platform, token_hash)
-		VALUES ($1::uuid, $2, $3, $4)
+		INSERT INTO devices (account_id, installation_id, name, platform, token_hash)
+		VALUES ($1::uuid, NULLIF($2, '')::uuid, $3, $4, $5)
+		ON CONFLICT (account_id, installation_id) WHERE installation_id IS NOT NULL DO UPDATE
+		SET name = EXCLUDED.name,
+			platform = EXCLUDED.platform,
+			token_hash = EXCLUDED.token_hash,
+			last_seen_at = now(),
+			last_pulled_seq = 0,
+			revoked_at = NULL
 		RETURNING id::text`
 
 	var deviceID string
-	err := pool.QueryRow(ctx, statement, accountID, deviceName, platform, tokenHash).Scan(&deviceID)
+	err := pool.QueryRow(ctx, statement, accountID, installationID, deviceName, platform, tokenHash).Scan(&deviceID)
 	if err != nil {
 		return "", fmt.Errorf("registering a device: %w", err)
 	}

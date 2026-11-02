@@ -18,6 +18,12 @@ type Event uint8
 const (
 	Changes Event = iota
 	Revoked
+
+	// Disconnected ends a stream without telling the client its credential is gone. It is for a
+	// device whose token was replaced rather than withdrawn: the client already holds the new one,
+	// and a `revoked` event racing it there would make the app forget the account it just signed
+	// in to. A plain close makes it reconnect with whatever token it holds now.
+	Disconnected
 )
 
 // Broker is an in-memory, non-blocking fan-out for the personal server's live process.
@@ -87,12 +93,40 @@ func (broker *Broker) Revoke(accountID string, deviceID string) {
 		if listener.accountID != accountID || listener.deviceID != deviceID {
 			continue
 		}
-		// Revocation outranks a queued content wakeup. The client cannot pull it anymore, and the
-		// explicit event lets it forget the now-useless token without a reconnect round trip.
-		select {
-		case <-listener.events:
-		default:
-		}
-		listener.events <- Revoked
+		// The explicit event lets the client forget the now-useless token without a reconnect
+		// round trip.
+		deliverUrgently(listener, Revoked)
 	}
+}
+
+// Disconnect closes every live connection for one device whose token has just been replaced, so
+// that no stream outlives the credential it was authenticated with.
+func (broker *Broker) Disconnect(accountID string, deviceID string) {
+	if broker == nil {
+		return
+	}
+
+	broker.mutex.Lock()
+	defer broker.mutex.Unlock()
+	for listener := range broker.subscribers {
+		if listener.accountID != accountID || listener.deviceID != deviceID {
+			continue
+		}
+		deliverUrgently(listener, Disconnected)
+	}
+}
+
+// deliverUrgently replaces whatever the listener had queued with an event that outranks it.
+//
+// Revocation and disconnection outrank a queued content wakeup: the connection cannot be trusted to
+// pull that content any more. Draining before sending is what makes the send safe to write as a
+// blocking one — the buffer holds a single event, so it always has room immediately afterwards — and
+// both callers hold the broker mutex throughout, which keeps this from racing Subscribe's cancel
+// closing the channel.
+func deliverUrgently(listener *subscriber, event Event) {
+	select {
+	case <-listener.events:
+	default:
+	}
+	listener.events <- event
 }

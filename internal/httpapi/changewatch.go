@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/AquilaIgnis/viveCServer/internal/auth"
 	"github.com/AquilaIgnis/viveCServer/internal/changefeed"
 	"github.com/AquilaIgnis/viveCServer/internal/store"
 	"github.com/AquilaIgnis/viveCServer/internal/syncengine"
@@ -44,6 +46,29 @@ func handleWatchChanges(
 
 		events, cancelSubscription := changeEvents.Subscribe(caller.AccountID, caller.DeviceID)
 		defer cancelSubscription()
+
+		// The middleware authenticated this request a moment ago, but a revocation or a sign-in that
+		// replaced the token can commit in the gap before Subscribe, and its broker event then finds
+		// nobody to close. One more lookup after subscribing leaves no gap: a change committed before
+		// it is visible here, and one committed after it reaches the subscription. One query per
+		// stream opened, not per sync request.
+		plainToken, _ := auth.ParseBearerToken(r.Header.Get("Authorization"))
+		deviceID, accountID, err := store.AuthenticateDeviceToken(r.Context(), pool, auth.HashDeviceToken(plainToken))
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			w.Header().Set("WWW-Authenticate", `Bearer realm="vivecserver", error="invalid_token"`)
+			writeError(w, logger, http.StatusUnauthorized, codeUnauthenticated, "unknown or revoked token")
+			return
+		case errors.Is(err, store.ErrLastSeenNotRecorded):
+			logger.Warn("could not record device last_seen_at", "device_id", deviceID, "error", err)
+		case err != nil:
+			writeInternalError(w, logger, "revalidating a change stream credential failed", err)
+			return
+		case deviceID != caller.DeviceID || accountID != caller.AccountID:
+			writeInternalError(w, logger, "revalidating a change stream credential changed its identity",
+				errors.New("authenticated device identity changed within one request"))
+			return
+		}
 
 		firstPage, err := syncengine.PullChanges(
 			r.Context(), pool, caller.AccountID, sinceCursor, defaultPullLimit,
@@ -103,6 +128,8 @@ func handleWatchChanges(
 					}
 				case changefeed.Revoked:
 					_ = writeChangeStreamEvent(controller, w, "revoked", []byte(`{}`))
+					return
+				case changefeed.Disconnected:
 					return
 				}
 			case <-r.Context().Done():

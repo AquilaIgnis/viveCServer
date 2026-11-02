@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.9.0
+  version: 0.10.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -175,6 +175,11 @@ paths:
         Call this once when connecting a viveNotes installation to the server. The plaintext device
         token is returned exactly once and cannot be recovered later because the server stores only
         its SHA-256 digest. If the client loses it, register a new device.
+
+        With an `installationId`, a later call from the same installation returns the same
+        `deviceId` with a new token instead of adding another device. The previous token stops
+        authenticating at once, any change stream it opened is closed without an event, and the
+        device's revocation (if any) is cleared. Without one, every call registers a new device.
       security: []
       requestBody:
         required: true
@@ -185,6 +190,7 @@ paths:
             example:
               email: owner@example.com
               password: correct horse battery staple
+              installationId: 9b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d
               name: Pixel Tablet Emulator
               platform: Android
       responses:
@@ -353,6 +359,10 @@ paths:
 
         If the authenticated device is revoked while connected, the server sends a terminal
         `revoked` event and closes the stream. The client must discard that account credential.
+
+        If the device signs in again from the same installation (see `registerDevice`), the stream
+        opened with the replaced token closes with no event. The client should reconnect with the
+        token it now holds; that is not a revocation.
       security:
         - deviceToken: []
       parameters:
@@ -820,6 +830,13 @@ components:
           default: ""
           description: Optional platform label used only for display.
           example: Android
+        installationId:
+          type: string
+          format: uuid
+          description: |
+            Optional stable UUID for this app installation. Sign-ins that send the same value reuse
+            one device record and rotate its token.
+          example: 9b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d
 
     RegisterDeviceResponse:
       type: object
