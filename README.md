@@ -33,7 +33,40 @@ For example:
  sudo chown -R 1000:1000 ./data/blobs
 ```
 
-## I lost my password 😱
+If you use a docker volume you won't have to deal with this , I just don't like them.
+
+# Download Clients
+
+<table>
+  <thead>
+    <tr>
+      <th>Linux</th>
+      <th>Google Play</th>
+      <th>Windows</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center">
+        <a href="https://github.com/CrownByte0b/viveNotes-multiplataform/releases/latest/">
+          <img src="repo/linux-logo.svg" height="80" width="200" alt="Get it on flathub">
+        </a>
+      </td>
+      <td align="center">
+        <a href="https://play.google.com/store/apps/details?id=com.vivenotes">
+          <img src="repo/Google_Play_Store.svg" height="80" width="200" alt="Get it on Google Play">
+        </a>
+      </td>
+      <td align="center">
+        <a href="https://github.com/CrownByte0b/viveNotes-multiplataform/releases/latest/download/ViveNotes-x64.msi">
+          <img src="repo/windows-logo.svg" height="80" alt="Download for Windows">
+        </a>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+# I lost my password 😱
 
 You will be prompted to enter a new one
 
