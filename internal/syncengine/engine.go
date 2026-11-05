@@ -394,14 +394,32 @@ func PullChanges(
 	sinceCursor int64,
 	limit int,
 ) (PullResult, error) {
-	result, err := selectChangePage(ctx, pool, accountID, sinceCursor, limit)
+	return PullFilteredChanges(ctx, pool, accountID, sinceCursor, limit, store.DeltaFilter{})
+}
+
+// PullFilteredChanges is [PullChanges] leaving out what the filter says to.
+//
+// A tree read is a scan and promises nothing: it carries no purges because no window of it is ever
+// committed. The client hears about those on the delta it commits a cursor from.
+func PullFilteredChanges(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	accountID string,
+	sinceCursor int64,
+	limit int,
+	filter store.DeltaFilter,
+) (PullResult, error) {
+	result, err := selectChangePage(ctx, pool, accountID, sinceCursor, limit, filter)
 	if err != nil {
 		return PullResult{}, err
 	}
 
-	purges, err := store.SelectPurges(ctx, pool, accountID, sinceCursor, result.Cursor)
-	if err != nil {
-		return PullResult{}, err
+	var purges []store.PurgeRow
+	if !filter.TreeOnly {
+		purges, err = store.SelectPurges(ctx, pool, accountID, sinceCursor, result.Cursor)
+		if err != nil {
+			return PullResult{}, err
+		}
 	}
 	result.Purges = make([]json.RawMessage, 0, len(purges))
 	for _, purge := range purges {
@@ -432,6 +450,7 @@ func selectChangePage(
 	accountID string,
 	sinceCursor int64,
 	limit int,
+	filter store.DeltaFilter,
 ) (PullResult, error) {
 	upperBound, err := store.ReadChangeSeq(ctx, pool, accountID)
 	if err != nil {
@@ -447,7 +466,7 @@ func selectChangePage(
 	}
 
 	cutoff, err := store.SelectDeltaCutoff(
-		ctx, pool, accountID, sinceCursor, upperBound, limit, store.MaxDeltaBytes,
+		ctx, pool, accountID, sinceCursor, upperBound, limit, store.MaxDeltaBytes, filter,
 	)
 	if err != nil {
 		return PullResult{}, err
@@ -466,7 +485,7 @@ func selectChangePage(
 		pageEnd = upperBound
 	}
 
-	delta, bytesRead, err := store.SelectDelta(ctx, pool, accountID, sinceCursor, pageEnd)
+	delta, bytesRead, err := store.SelectDelta(ctx, pool, accountID, sinceCursor, pageEnd, filter)
 	if err != nil {
 		return PullResult{}, err
 	}

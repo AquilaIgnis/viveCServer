@@ -2,7 +2,7 @@ openapi: 3.1.2
 
 info:
   title: Vive Notes Community Server API
-  version: 0.10.0
+  version: 0.11.0
   summary: Device authentication and notebook synchronisation API for viveNotes.
   description: |
     This document describes the API currently implemented on viveCServer's sync listener
@@ -415,6 +415,10 @@ paths:
 
         The delta includes the calling device's own writes. That is deliberate — it is what lets a
         device whose push response was lost recover the authoritative row by pulling.
+
+        This server keeps its whole delta and has no cursor floor, so it never answers
+        `410 cursor_expired`. The app also talks to servers that do, and sends `reconcile=true` on a
+        first pull. Here that is an unknown parameter and is ignored, as any other would be.
       security:
         - deviceToken: []
       parameters:
@@ -437,6 +441,43 @@ paths:
             minimum: 1
             maximum: 2048
             default: 512
+        - name: scope
+          in: query
+          required: false
+          description: |
+            `tree` returns only `notebook`, `section` and `page` rows, so a device joining an account
+            can learn the account's shape, including which notebooks are closed, before it downloads
+            any content.
+
+            A tree read is a scan and not a position in the delta. While paging, `since` is the scan
+            position: it is not recorded as acknowledged, and it must not be stored as the durable
+            sync cursor. `purges` is always empty, because those arrive on the delta the client
+            commits a cursor from. That delta returns the same tree rows again; a row with a `seq` at
+            or below the last scan position is already applied.
+
+            A server older than 0.11.0 ignores this parameter and answers with the ordinary delta,
+            which a client recognises by the first row of another kind.
+          schema:
+            type: string
+            enum: [tree]
+        - name: skipNotebook
+          in: query
+          required: false
+          description: |
+            Leaves out `pageContent` and ink rows under these notebooks, judged by where each page is
+            now. Their `notebook`, `section` and `page` rows still arrive, and so do attachments,
+            which belong to no notebook. Repeat the parameter once per id. Cannot be combined with
+            `scope`.
+
+            `cursor` still covers what was left out, so a client naming a notebook takes on fetching
+            that notebook's content some other way before it shows it. A server older than 0.11.0
+            ignores this parameter and returns those rows, so a client must still be able to discard
+            them.
+          schema:
+            type: array
+            maxItems: 256
+            items:
+              type: string
       responses:
         '200':
           description: |

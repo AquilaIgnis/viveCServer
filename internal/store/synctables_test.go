@@ -85,13 +85,65 @@ func TestFieldKeysComeFromTheStructTags(t *testing.T) {
 // TestTheDeltaQueryReadsEveryKind: a kind missing from the union would be stored and then never
 // delivered to anybody.
 func TestTheDeltaQueryReadsEveryKind(t *testing.T) {
-	for _, kind := range SyncKindsInApplyOrder() {
-		if !strings.Contains(selectDeltaStatement, "FROM "+kind.Table+"\n") {
-			t.Errorf("the delta query never reads %s", kind.Table)
+	for _, statement := range []string{
+		selectDeltaStatements[deltaWhole],
+		selectDeltaStatements[deltaSkippingNotebooks],
+	} {
+		for _, kind := range SyncKindsInApplyOrder() {
+			if !strings.Contains(statement, "FROM "+kind.Table+"\n") {
+				t.Errorf("the delta query never reads %s", kind.Table)
+			}
+		}
+		if !strings.Contains(statement, "ORDER BY change_seq, kind_rank, id") {
+			t.Error("the delta query does not order parents before children within a sequence value")
 		}
 	}
-	if !strings.Contains(selectDeltaStatement, "ORDER BY change_seq, kind_rank, id") {
-		t.Error("the delta query does not order parents before children within a sequence value")
+}
+
+// TestEveryKindIsEitherInTheTreeOrSkippable: a kind added later has to land on one side or the other
+// deliberately. Anything under a page that a skip does not cover would still download a closed
+// notebook's content, and a tree read has to stay small enough to be worth reading first.
+func TestEveryKindIsEitherInTheTreeOrSkippable(t *testing.T) {
+	for _, kind := range SyncKindsInApplyOrder() {
+		inTreeStatements := strings.Contains(selectDeltaStatements[deltaTreeOnly], "FROM "+kind.Table+"\n") &&
+			strings.Contains(selectDeltaCutoffStatements[deltaTreeOnly], "FROM "+kind.Table+"\n")
+		if inTreeStatements != kind.InTree {
+			t.Errorf("%s: a tree read reads it = %v, want %v", kind.Name, inTreeStatements, kind.InTree)
+		}
+
+		skippable := kind.ParentKind == "page"
+		if skippable == kind.InTree && skippable {
+			t.Errorf("%s is both in the tree and skippable", kind.Name)
+		}
+		if !kind.InTree && !skippable && kind.Name != "attachment" {
+			t.Errorf("%s is neither in the tree nor skippable, so a skipped notebook would still send it", kind.Name)
+		}
+	}
+
+	// One clause per child of a page, in both halves: a boundary chosen from rows the read then leaves
+	// out is an empty page with more to come.
+	const clause = "section.notebook_id = ANY("
+	wantClauses := 0
+	for _, kind := range SyncKindsInApplyOrder() {
+		if kind.ParentKind == "page" {
+			wantClauses++
+		}
+	}
+	for name, statement := range map[string]string{
+		"delta":  selectDeltaStatements[deltaSkippingNotebooks],
+		"cutoff": selectDeltaCutoffStatements[deltaSkippingNotebooks],
+	} {
+		if got := strings.Count(statement, clause); got != wantClauses {
+			t.Errorf("the %s statement skips %d kinds, want %d", name, got, wantClauses)
+		}
+	}
+	for name, statement := range map[string]string{
+		"delta":  selectDeltaStatements[deltaWhole],
+		"cutoff": selectDeltaCutoffStatements[deltaWhole],
+	} {
+		if strings.Contains(statement, clause) {
+			t.Errorf("the unfiltered %s statement skips something", name)
+		}
 	}
 }
 
@@ -103,7 +155,7 @@ func TestThePageBoundaryQueryWeighsEveryKind(t *testing.T) {
 		if strings.TrimSpace(kind.byteWeight) == "" {
 			t.Errorf("%s has no byteWeight", kind.Name)
 		}
-		if !strings.Contains(selectDeltaCutoffStatement, "FROM "+kind.Table+"\n") {
+		if !strings.Contains(selectDeltaCutoffStatements[deltaWhole], "FROM "+kind.Table+"\n") {
 			t.Errorf("the page boundary query never weighs %s", kind.Table)
 		}
 	}

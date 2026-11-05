@@ -141,6 +141,9 @@ type SyncKind struct {
 	// ParentKind is the kind whose ids ParentID returns, or "" when the kind has no parent.
 	ParentKind string
 
+	// InTree marks the kinds that index an account rather than hold its content. See [DeltaFilter].
+	InTree bool
+
 	// changeJSON is the SQL expression that renders a row of this table into the object a client
 	// receives. `extra ||` comes first so that a stored unknown field can never overwrite the
 	// identity or version the server assigned.
@@ -208,6 +211,7 @@ var syncKinds = []*SyncKind{
 		Rank:       0,
 		Table:      "notebooks",
 		ParentKind: "",
+		InTree:     true,
 		changeJSON: notebookChangeJSON,
 		byteWeight: notebookByteWeight,
 		newFields:  func() EntityFields { return &NotebookFields{} },
@@ -217,6 +221,7 @@ var syncKinds = []*SyncKind{
 		Rank:       1,
 		Table:      "sections",
 		ParentKind: "notebook",
+		InTree:     true,
 		changeJSON: sectionChangeJSON,
 		byteWeight: sectionByteWeight,
 		newFields:  func() EntityFields { return &SectionFields{} },
@@ -226,6 +231,7 @@ var syncKinds = []*SyncKind{
 		Rank:       2,
 		Table:      "pages",
 		ParentKind: "section",
+		InTree:     true,
 		changeJSON: pageChangeJSON,
 		byteWeight: pageByteWeight,
 		newFields:  func() EntityFields { return &PageFields{} },
@@ -521,32 +527,110 @@ const MaxDeltaBytes = 8 << 20
 // large overrun on a multi-sequence page means a byteWeight no longer matches its changeJSON.
 const DeltaBytesOverrunFactor = 4
 
-// selectDeltaStatement is built once from the registry: one branch per kind, unioned and ordered
+// DeltaFilter narrows what a pull returns, which is what lets a device joining an account stop
+// downloading content it has no use for. The zero value is the whole delta.
+type DeltaFilter struct {
+	// TreeOnly returns notebooks, sections and pages and nothing under them. Such a read is a scan
+	// rather than a position in the delta: the client commits no cursor from it.
+	TreeOnly bool
+
+	// SkipNotebooks leaves out the page bodies and ink under these notebooks. Their tree rows still
+	// arrive, because the client keeps the index of a notebook whose content it does not hold.
+	// Attachments still arrive too: they belong to no notebook, and the client decides from the
+	// bodies it keeps which ones it wants.
+	//
+	// Named by the client rather than read from `closed_at`. A notebook reopened while a first sync
+	// is running would otherwise have its older content skipped and its newer content sent, with
+	// neither side knowing. What the client named is what it recorded as not holding.
+	SkipNotebooks []string
+}
+
+// deltaShape is which statement text a filter reads with. The ids in [DeltaFilter.SkipNotebooks]
+// travel as a parameter, so the three texts are all there will ever be.
+type deltaShape int
+
+const (
+	deltaWhole deltaShape = iota
+	deltaTreeOnly
+	deltaSkippingNotebooks
+)
+
+func (filter DeltaFilter) shape() deltaShape {
+	switch {
+	case filter.TreeOnly:
+		return deltaTreeOnly
+	case len(filter.SkipNotebooks) > 0:
+		return deltaSkippingNotebooks
+	default:
+		return deltaWhole
+	}
+}
+
+// reads reports whether a statement of this shape has a branch for the kind.
+func (shape deltaShape) reads(kind *SyncKind) bool {
+	return shape != deltaTreeOnly || kind.InTree
+}
+
+// notebooksClause is what a branch adds to its WHERE to leave out the skipped notebooks, given the
+// statement's parameter for their ids. Only a page's children have anything to leave out.
+//
+// A page moved between notebooks counts as being where it is now, so its content is never withheld
+// on the strength of where it used to be.
+func (shape deltaShape) notebooksClause(kind *SyncKind, parameter string) string {
+	if shape != deltaSkippingNotebooks || kind.ParentKind != "page" {
+		return ""
+	}
+	return fmt.Sprintf(`
+		AND page_id NOT IN (
+			SELECT page.id
+			FROM pages AS page
+			JOIN sections AS section
+				ON section.account_id = page.account_id AND section.id = page.section_id
+			WHERE page.account_id = $1::uuid AND section.notebook_id = ANY(%s::text[])
+		)`, parameter)
+}
+
+// selectDeltaStatements are built once from the registry: one branch per kind, unioned and ordered
 // globally so a client receives parents before children within each sequence value.
 //
 // No LIMIT — [SelectDeltaCutoff] has already chosen the last sequence, so every row returned is one
 // the client receives. A LIMIT here cannot push down through the sort, which would render
 // changeJSON for the whole remaining delta on every page and discard all but one page of it.
-var selectDeltaStatement = func() string {
+var selectDeltaStatements = [...]string{
+	deltaWhole:             buildSelectDeltaStatement(deltaWhole),
+	deltaTreeOnly:          buildSelectDeltaStatement(deltaTreeOnly),
+	deltaSkippingNotebooks: buildSelectDeltaStatement(deltaSkippingNotebooks),
+}
+
+func buildSelectDeltaStatement(shape deltaShape) string {
 	var query strings.Builder
 	query.WriteString("WITH delta AS (\n")
-	for index, kind := range syncKinds {
-		if index > 0 {
+	wroteBranch := false
+	for _, kind := range syncKinds {
+		if !shape.reads(kind) {
+			continue
+		}
+		if wroteBranch {
 			query.WriteString("\tUNION ALL\n")
 		}
+		wroteBranch = true
 		fmt.Fprintf(&query,
 			"\tSELECT change_seq, %d AS kind_rank, id, %s AS change\n\tFROM %s\n"+
-				"\tWHERE account_id = $1::uuid AND change_seq > $2 AND change_seq <= $3\n",
-			kind.Rank, kind.changeJSON, kind.Table,
+				"\tWHERE account_id = $1::uuid AND change_seq > $2 AND change_seq <= $3%s\n",
+			kind.Rank, kind.changeJSON, kind.Table, shape.notebooksClause(kind, "$4"),
 		)
 	}
 	query.WriteString(")\nSELECT change_seq, change FROM delta ORDER BY change_seq, kind_rank, id")
 	return query.String()
-}()
+}
 
-// selectDeltaCutoffStatement decides where a page ends, before anything is rendered. Each branch
+// selectDeltaCutoffStatements decide where a page ends, before anything is rendered. Each branch
 // contributes a sequence number and an estimated size; the answer is the largest sequence whose
 // running totals are inside both budgets.
+//
+// A filter has to be applied here as well as in [selectDeltaStatements]. A boundary chosen from rows
+// the read then leaves out would produce an empty page with more to come, which a client is entitled
+// to treat as a broken server.
 //
 // The fallback to min(change_seq) is what makes `limit` a request rather than a cap. A sequence is
 // atomic across kinds — a page and the section it was moved into are stamped with one value — so a
@@ -555,17 +639,28 @@ var selectDeltaStatement = func() string {
 //
 // `complete` reports that nothing was excluded, so the caller can return the account's cursor
 // rather than the last row's — they differ when a sequence exists that this delta has no rows for.
-var selectDeltaCutoffStatement = func() string {
+var selectDeltaCutoffStatements = [...]string{
+	deltaWhole:             buildSelectDeltaCutoffStatement(deltaWhole),
+	deltaTreeOnly:          buildSelectDeltaCutoffStatement(deltaTreeOnly),
+	deltaSkippingNotebooks: buildSelectDeltaCutoffStatement(deltaSkippingNotebooks),
+}
+
+func buildSelectDeltaCutoffStatement(shape deltaShape) string {
 	var query strings.Builder
 	query.WriteString("WITH weighted AS (\n")
-	for index, kind := range syncKinds {
-		if index > 0 {
+	wroteBranch := false
+	for _, kind := range syncKinds {
+		if !shape.reads(kind) {
+			continue
+		}
+		if wroteBranch {
 			query.WriteString("\tUNION ALL\n")
 		}
+		wroteBranch = true
 		fmt.Fprintf(&query,
 			"\tSELECT change_seq, (%s)::bigint AS weight\n\tFROM %s\n"+
-				"\tWHERE account_id = $1::uuid AND change_seq > $2 AND change_seq <= $3\n",
-			kind.byteWeight, kind.Table,
+				"\tWHERE account_id = $1::uuid AND change_seq > $2 AND change_seq <= $3%s\n",
+			kind.byteWeight, kind.Table, shape.notebooksClause(kind, "$6"),
 		)
 	}
 	query.WriteString(`), per_sequence AS (
@@ -584,7 +679,7 @@ SELECT
 	coalesce(bool_and(fits), true)
 FROM running`)
 	return query.String()
-}()
+}
 
 // DeltaCutoff is where one pull's page ends.
 type DeltaCutoff struct {
@@ -609,12 +704,18 @@ func SelectDeltaCutoff(
 	upperBound int64,
 	rowLimit int,
 	byteBudget int64,
+	filter DeltaFilter,
 ) (DeltaCutoff, error) {
+	shape := filter.shape()
+	arguments := []any{accountID, sinceCursor, upperBound, rowLimit, byteBudget}
+	if shape == deltaSkippingNotebooks {
+		arguments = append(arguments, filter.SkipNotebooks)
+	}
+
 	var sequence *int64
 	var complete bool
-	err := database.QueryRow(ctx, selectDeltaCutoffStatement,
-		accountID, sinceCursor, upperBound, rowLimit, byteBudget,
-	).Scan(&sequence, &complete)
+	err := database.QueryRow(ctx, selectDeltaCutoffStatements[shape], arguments...).
+		Scan(&sequence, &complete)
 	if err != nil {
 		return DeltaCutoff{}, fmt.Errorf("finding a change delta boundary: %w", err)
 	}
@@ -637,8 +738,15 @@ func SelectDelta(
 	accountID string,
 	sinceCursor int64,
 	upperBound int64,
+	filter DeltaFilter,
 ) (delta []DeltaRow, bytesRead int, err error) {
-	rows, err := database.Query(ctx, selectDeltaStatement, accountID, sinceCursor, upperBound)
+	shape := filter.shape()
+	arguments := []any{accountID, sinceCursor, upperBound}
+	if shape == deltaSkippingNotebooks {
+		arguments = append(arguments, filter.SkipNotebooks)
+	}
+
+	rows, err := database.Query(ctx, selectDeltaStatements[shape], arguments...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("reading a change delta: %w", err)
 	}

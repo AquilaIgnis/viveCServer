@@ -28,6 +28,11 @@ const (
 	maxPullLimit     = 2048
 )
 
+// maxSkippedNotebooks bounds the ids one pull can name, and with them the size of the query it runs.
+// An account on more shelves than this still pulls correctly: the client drops what it did not get
+// to name, as it would from a server without the parameter.
+const maxSkippedNotebooks = 256
+
 type cursorResponse struct {
 	Cursor int64 `json:"cursor"`
 }
@@ -75,8 +80,15 @@ func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 			writeError(w, logger, http.StatusBadRequest, codeInvalidRequest, err.Error())
 			return
 		}
+		filter, err := readDeltaFilter(r)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, codeInvalidRequest, err.Error())
+			return
+		}
 
-		result, err := syncengine.PullChanges(r.Context(), pool, caller.AccountID, sinceCursor, int(limit))
+		result, err := syncengine.PullFilteredChanges(
+			r.Context(), pool, caller.AccountID, sinceCursor, int(limit), filter,
+		)
 		if err != nil {
 			writeInternalError(w, logger, "reading a change delta failed", err)
 			return
@@ -87,15 +99,22 @@ func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 		// before writing the body would let a dropped connection acknowledge a purge the client
 		// never saw. This is what decides when a purge stops being worth keeping
 		// (store.PrunePurges); it is housekeeping and never allowed to fail the pull.
-		if err := store.RecordAcknowledgedSeq(r.Context(), pool, caller.DeviceID, sinceCursor); err != nil {
-			logger.Warn("could not record a device acknowledged cursor",
-				"account_id", caller.AccountID, "device_id", caller.DeviceID, "error", err)
+		//
+		// A tree read proves nothing of the kind: its `since` is a position in a scan that carries no
+		// purges, and acknowledging it would let the account forget a purge this device has not heard.
+		if !filter.TreeOnly {
+			if err := store.RecordAcknowledgedSeq(r.Context(), pool, caller.DeviceID, sinceCursor); err != nil {
+				logger.Warn("could not record a device acknowledged cursor",
+					"account_id", caller.AccountID, "device_id", caller.DeviceID, "error", err)
+			}
 		}
 
 		logger.Debug("changes pulled",
 			"account_id", caller.AccountID,
 			"device_id", caller.DeviceID,
 			"since", sinceCursor,
+			"tree_only", filter.TreeOnly,
+			"skipped_notebooks", len(filter.SkipNotebooks),
 			"returned", len(result.Changes),
 			"purged", len(result.Purges),
 			"cursor", result.Cursor,
@@ -103,6 +122,43 @@ func handlePullChanges(pool *pgxpool.Pool, logger *slog.Logger) http.HandlerFunc
 		)
 		writeJSON(w, logger, http.StatusOK, result)
 	}
+}
+
+// readDeltaFilter reads `scope` and `skipNotebook`. Each filter leaves rows out, so a combination
+// that cannot mean anything is refused rather than guessed at.
+func readDeltaFilter(r *http.Request) (store.DeltaFilter, error) {
+	query := r.URL.Query()
+
+	var filter store.DeltaFilter
+	switch scope := query.Get("scope"); scope {
+	case "":
+	case "tree":
+		filter.TreeOnly = true
+	default:
+		return store.DeltaFilter{}, &queryParameterError{name: "scope", detail: "must be tree"}
+	}
+
+	skipped := query["skipNotebook"]
+	if len(skipped) > maxSkippedNotebooks {
+		return store.DeltaFilter{}, &queryParameterError{
+			name:   "skipNotebook",
+			detail: "must name at most " + strconv.Itoa(maxSkippedNotebooks) + " notebooks",
+		}
+	}
+	for _, notebookID := range skipped {
+		if err := store.ValidateEntityID(notebookID); err != nil {
+			return store.DeltaFilter{}, &queryParameterError{name: "skipNotebook", detail: err.Error()}
+		}
+	}
+	filter.SkipNotebooks = skipped
+
+	if filter.TreeOnly && len(skipped) > 0 {
+		return store.DeltaFilter{}, &queryParameterError{
+			name:   "skipNotebook",
+			detail: "has nothing to leave out of a tree read",
+		}
+	}
+	return filter, nil
 }
 
 // handlePushChanges applies a batch of client changes.
